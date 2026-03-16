@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:orientation="vertical" android:layout_width="match_parent" android:layout_height="match_parent" android:padding="12dp">
+    <TextView android:id="@+id/info_tv" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Info" />
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+        <Button android:id="@+id/refresh_btn" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="刷新任务" />
+        <Button android:id="@+id/export_btn" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="导出日志" />
+    </LinearLayout>
+    <androidx.recyclerview.widget.RecyclerView android:id="@+id/debug_rv" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" />
+</LinearLayout>
