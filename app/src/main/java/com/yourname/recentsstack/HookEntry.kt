@@ -4,6 +4,8 @@ import android.app.Activity
 import android.app.ActivityManager
 import android.content.Context
 import android.os.Bundle
+import android.view.View
+import android.view.ViewGroup
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -27,6 +29,11 @@ class HookEntry : IXposedHookLoadPackage {
         )
     }
 
+    // Throttle and limits
+    private val lastDumpForActivity = mutableMapOf<String, Long>()
+    private val DUMP_MIN_INTERVAL_MS = 1500L
+    private val MAX_FULL_LOG_BYTES = 3 * 1024 * 1024 // 3MB
+
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
             val pkg = lpparam.packageName
@@ -36,10 +43,13 @@ class HookEntry : IXposedHookLoadPackage {
             // dump diagnostics to sdcard to help analysis
             try { dumpSystemUiDiagnostics(lpparam.classLoader) } catch (t: Throwable) { Logger.e(TAG, "dumpSystemUiDiagnostics failed: ${t.message}", "系统诊断导出失败: ${t.message}", t) }
 
-            // 1) keep activity hook (some ROMs use Activity)
-            try { hookAllActivities(lpparam.classLoader) } catch (t: Throwable) { Logger.e(TAG, "hookAllActivities failed: ${t.message}", "安装 Activity 钩子失败: ${t.message}", t) }
+            // 1) Install global capture hooks (Activity, View, WindowManager)
+            try { installGlobalCapture(lpparam.classLoader) } catch (t: Throwable) { Logger.e(TAG, "installGlobalCapture failed: ${t.message}", "安装全局捕获失败: ${t.message}", t) }
 
-            // 2) key: hook recents methods (more reliable)
+            // 2) Robust method hooks with pattern matching
+            try { addRobustMethodHooks(lpparam.classLoader) } catch (t: Throwable) { Logger.e(TAG, "addRobustMethodHooks failed: ${t.message}", "添加稳健方法钩子失败: ${t.message}", t) }
+
+            // 3) Keep legacy hooks for compatibility
             try { addHooksForRecentsMethods(lpparam.classLoader) } catch (t: Throwable) { Logger.e(TAG, "addHooksForRecentsMethods failed: ${t.message}", "添加 recents 方法钩子失败: ${t.message}", t) }
 
         } catch (t: Throwable) {
@@ -47,32 +57,156 @@ class HookEntry : IXposedHookLoadPackage {
         }
     }
 
-    // Hook all Activity.onResume (keeps compatibility)
-    private fun hookAllActivities(classLoader: ClassLoader) {
+    // ====== Global Capture Hooks ======
+    private fun installGlobalCapture(classLoader: ClassLoader) {
         try {
-            val activityClass = Class.forName("android.app.Activity", false, classLoader)
-            XposedBridge.hookAllMethods(activityClass, "onResume", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    try {
-                        val activity = param.thisObject as? Activity ?: return
-                        val name = activity.javaClass.name
-                        Logger.d(TAG, "Activity resumed: $name", "Activity 恢复: $name")
-                        if (name.contains("recents", true) || name.contains("overview", true) || name.contains("Recent", true)) {
-                            Logger.d(TAG, "HIT Recents Activity: $name", "检测到 Recents Activity: $name")
-                            try { injectStackView(activity, activity.classLoader) } catch (t: Throwable) { Logger.e(TAG, "injectStackView failed: ${t.message}", "注入视图失败: ${t.message}", t) }
+            Logger.d(TAG, "installGlobalCapture start", "开始安装全局捕获")
+
+            // Activity.onResume hook
+            try {
+                val activityCls = Class.forName("android.app.Activity", false, classLoader)
+                XposedBridge.hookAllMethods(activityCls, "onResume", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val act = param.thisObject as? Activity ?: return
+                            val name = act.javaClass.name
+                            Logger.d(TAG, "ACTIVITY_RESUME", "Activity resumed: $name", "Activity 恢复: $name")
+                            val now = System.currentTimeMillis()
+                            val last = lastDumpForActivity[name] ?: 0L
+                            if (now - last >= DUMP_MIN_INTERVAL_MS) {
+                                lastDumpForActivity[name] = now
+                                appendFullLogSafe("\n=== Activity Resume: $name @ $now ===\n")
+                                dumpViewTree(act)
+                            } else {
+                                Logger.d(TAG, "ACTIVITY_RESUME_THROTTLE", "Throttled dump for $name")
+                            }
+                        } catch (t: Throwable) {
+                            Logger.e(TAG, "onResume hook err: ${t.message}", "onResume 钩子错误: ${t.message}", t)
                         }
-                    } catch (t: Throwable) {
-                        Logger.e(TAG, "onResume hook error: ${t.message}", "onResume 钩子错误: ${t.message}", t)
+                    }
+                })
+            } catch (t: Throwable) {
+                Logger.e(TAG, "installGlobalCapture hook Activity failed: ${t.message}", "安装 Activity 钩子失败: ${t.message}", t)
+            }
+
+            // WindowManagerGlobal.addView hook
+            try {
+                val wmgCls = Class.forName("android.view.WindowManagerGlobal", false, classLoader)
+                for (m in wmgCls.declaredMethods) {
+                    if (m.name == "addView") {
+                        try {
+                            XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                                override fun beforeHookedMethod(param: MethodHookParam) {
+                                    try {
+                                        val viewObj = param.args?.getOrNull(0)
+                                        val viewClass = viewObj?.javaClass?.name ?: "<null>"
+                                        Logger.d(TAG, "ADD_VIEW", "WindowManagerGlobal.addView: $viewClass")
+                                        appendFullLogSafe("=== addView: $viewClass ===\n")
+                                    } catch (_: Throwable) {}
+                                }
+                            })
+                        } catch (t: Throwable) {
+                            Logger.e(TAG, "hook addView method failed: ${t.message}", "钩子 addView 失败: ${t.message}", t)
+                        }
                     }
                 }
-            })
-            Logger.d(TAG, "hookAllActivities installed", "已安装 Activity onResume 钩子")
+            } catch (t: Throwable) {
+                Logger.e(TAG, "installGlobalCapture hook addView failed: ${t.message}", "安装 addView 钩子失败: ${t.message}", t)
+            }
+
+            // View.onAttachedToWindow hook
+            try {
+                val viewCls = Class.forName("android.view.View", false, classLoader)
+                XposedBridge.hookAllMethods(viewCls, "onAttachedToWindow", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val v = param.thisObject as? View ?: return
+                            val clsName = v.javaClass.name
+                            if (clsName.contains("recents", true) || clsName.contains("overview", true) || clsName.contains("task", true)) {
+                                Logger.d(TAG, "RECENTS_VIEW_ATTACH", "View attached: $clsName")
+                                appendFullLogSafe("=== RecentsViewAttached: $clsName ===\n")
+                                val ctx = findContextFromObject(v)
+                                if (ctx is Activity) dumpViewTree(ctx)
+                            }
+                        } catch (t: Throwable) {
+                            Logger.e(TAG, "onAttachedToWindow hook err: ${t.message}", "onAttachedToWindow 钩子错误: ${t.message}", t)
+                        }
+                    }
+                })
+            } catch (t: Throwable) {
+                Logger.e(TAG, "installGlobalCapture hook View failed: ${t.message}", "View 钩子安装失败: ${t.message}", t)
+            }
+
+            Logger.d(TAG, "installGlobalCapture done", "全局捕获安装完成")
         } catch (t: Throwable) {
-            Logger.e(TAG, "hookAllActivities error: ${t.message}", "安装 Activity 钩子失败: ${t.message}", t)
+            Logger.e(TAG, "installGlobalCapture general error: ${t.message}", "全局捕获总体错误: ${t.message}", t)
         }
     }
 
-    // Add method-level hooks on Recents controller classes
+    // ====== Robust Method Hooks with Pattern Matching ======
+    private fun addRobustMethodHooks(classLoader: ClassLoader) {
+        try {
+            val candidates = listOf(
+                "com.android.systemui.recents.RecentsImplementation",
+                "com.android.systemui.recents.OverviewProxyRecentsImpl",
+                "com.android.systemui.recents.LauncherProxyService",
+                "com.android.systemui.statusbar.CommandQueue"
+            )
+            val pattern = Regex("(?i).*(show|toggle|recent|overview|notify|preload|notifyToggle).*")
+            var hooked = 0
+
+            for (clsName in candidates) {
+                try {
+                    val cls = XposedHelpers.findClassIfExists(clsName, classLoader)
+                    if (cls == null) {
+                        Logger.d(TAG, "candidate-missing", "Candidate not found: $clsName")
+                        continue
+                    }
+                    Logger.d(TAG, "candidate-found", "Found candidate: $clsName")
+
+                    for (m in cls.declaredMethods) {
+                        try {
+                            val name = m.name
+                            if (pattern.matches(name)) {
+                                try {
+                                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                                        override fun beforeHookedMethod(param: MethodHookParam) {
+                                            try {
+                                                Logger.d(TAG, "method-before", "$clsName.$name BEFORE")
+                                                appendFullLogSafe("BEFORE METHOD: $clsName.$name this=${param.thisObject?.javaClass?.name}\n")
+                                            } catch (_: Throwable) {}
+                                        }
+                                        override fun afterHookedMethod(param: MethodHookParam) {
+                                            try {
+                                                Logger.d(TAG, "method-after", "$clsName.$name AFTER")
+                                                appendFullLogSafe("AFTER METHOD: $clsName.$name this=${param.thisObject?.javaClass?.name}\n")
+                                                val ctx = findContextFromObject(param.thisObject) ?: (param.thisObject as? Activity)
+                                                if (ctx is Activity) injectStackView(ctx, classLoader)
+                                            } catch (t: Throwable) {
+                                                Logger.e(TAG, "method-hook-after err: ${t.message}", "方法钩子后处理错误: ${t.message}", t)
+                                            }
+                                        }
+                                    })
+                                    hooked++
+                                } catch (t: Throwable) {
+                                    Logger.e(TAG, "hookMethod failed: ${t.message}", "hookMethod 失败: ${t.message}", t)
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                } catch (t: Throwable) {
+                    Logger.e(TAG, "candidate loop error: ${t.message}", "循环候选出错: ${t.message}", t)
+                }
+            }
+
+            Logger.d(TAG, "method-hook-summary", "hooked methods approx: $hooked")
+            appendFullLogSafe("HOOK SUMMARY: hooked methods approx: $hooked\n")
+        } catch (t: Throwable) {
+            Logger.e(TAG, "addRobustMethodHooks failed: ${t.message}", "添加稳健方法钩子失败: ${t.message}", t)
+        }
+    }
+
+    // ====== Legacy Method Hooks ======
     private fun addHooksForRecentsMethods(classLoader: ClassLoader) {
         val boolType = java.lang.Boolean.TYPE
         val candidates = listOf(
@@ -116,55 +250,66 @@ class HookEntry : IXposedHookLoadPackage {
                     })
                 } catch (_: Throwable) {}
 
-                // preloadRecentApps()
-                try {
-                    XposedHelpers.findAndHookMethod(cls, "preloadRecentApps", object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            Logger.d(TAG, "$clsName.preloadRecentApps() called", "$clsName.preloadRecentApps() 被调用")
-                        }
-                    })
-                } catch (_: Throwable) {}
-
-                // hideRecentApps(bool,bool) or hideRecentApps(bool)
-                try {
-                    XposedHelpers.findAndHookMethod(cls, "hideRecentApps", boolType, boolType, object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            Logger.d(TAG, "$clsName.hideRecentApps(bool,bool) called", "$clsName.hideRecentApps 被调用")
-                        }
-                    })
-                } catch (_: Throwable) {
-                    try {
-                        XposedHelpers.findAndHookMethod(cls, "hideRecentApps", boolType, object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam) {
-                                Logger.d(TAG, "$clsName.hideRecentApps(bool) called", "$clsName.hideRecentApps 被调用")
-                            }
-                        })
-                    } catch (_: Throwable) {}
-                }
-
-                if (clsName.contains("LauncherProxyService")) {
-                    try {
-                        XposedHelpers.findAndHookMethod(cls, "notifyToggleRecentApps", object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam) {
-                                Logger.d(TAG, "LauncherProxyService.notifyToggleRecentApps() called", "LauncherProxyService.notifyToggleRecentApps 被调用")
-                                try {
-                                    val ctx = findContextFromObject(param.thisObject) ?: (param.thisObject as? Activity)
-                                    if (ctx is Activity) injectStackView(ctx, classLoader)
-                                } catch (t: Throwable) { Logger.e(TAG, "after notifyToggleRecentApps error: ${t.message}", "notifyToggleRecentApps 后处理错误: ${t.message}", t) }
-                            }
-                        })
-                    } catch (_: Throwable) {}
-                }
-
             } catch (t: Throwable) {
                 Logger.e(TAG, "addHooksForRecentsMethods error for $clsName: ${t.message}", "添加方法钩子错误: $clsName ${t.message}", t)
             }
         }
-
         Logger.d(TAG, "Completed adding method hooks for recents candidates", "已完成为 recents 候选添加方法钩子")
     }
 
-    // dump some diagnostics to /sdcard/RecentsStack/systemui_dump_TIMESTAMP.txt
+    // ====== View Tree Dump ======
+    private fun dumpViewTree(activity: Activity) {
+        try {
+            val decor = activity.window?.decorView as? ViewGroup ?: return
+            val sb = StringBuilder()
+            sb.append("\n=== ViewTree for ").append(activity.javaClass.name).append(" ===\n")
+
+            fun dfs(v: View, depth: Int) {
+                repeat(depth) { sb.append("  ") }
+                sb.append(v.javaClass.name)
+                val idName = try {
+                    if (v.id != View.NO_ID) activity.resources.getResourceEntryName(v.id) else null
+                } catch (_: Throwable) { null }
+                if (!idName.isNullOrBlank()) sb.append(" #").append(idName)
+                sb.append("\n")
+                if (v is ViewGroup) {
+                    for (i in 0 until v.childCount) {
+                        try { dfs(v.getChildAt(i), depth + 1) } catch (_: Throwable) {}
+                    }
+                }
+            }
+            dfs(decor, 0)
+            sb.append("=== End ViewTree ===\n")
+            appendFullLogSafe(sb.toString())
+        } catch (t: Throwable) {
+            Logger.e(TAG, "dumpViewTree err: ${t.message}", "View树dump失败: ${t.message}", t)
+        }
+    }
+
+    // ====== Safe Log Append with Rotation ======
+    private fun appendFullLogSafe(text: String) {
+        try {
+            val dir = File("/sdcard/RecentsStack")
+            if (!dir.exists()) dir.mkdirs()
+            val full = File(dir, "full_log.txt")
+            if (full.exists() && full.length() > MAX_FULL_LOG_BYTES) {
+                try {
+                    val rotated = File(dir, "full_log_${System.currentTimeMillis()}.txt")
+                    full.renameTo(rotated)
+                    full.writeText("")
+                } catch (_: Throwable) {}
+            }
+            full.appendText(text)
+        } catch (e: Throwable) {
+            try {
+                val f2 = File("/data/local/tmp/full_log.txt")
+                if (!f2.parentFile.exists()) f2.parentFile.mkdirs()
+                f2.appendText(text)
+            } catch (_: Throwable) {}
+        }
+    }
+
+    // ====== Diagnostics Dump ======
     private fun dumpSystemUiDiagnostics(classLoader: ClassLoader) {
         val stamp = System.currentTimeMillis()
         val dir = File("/sdcard/RecentsStack")
@@ -181,7 +326,6 @@ class HookEntry : IXposedHookLoadPackage {
                     val cls = XposedHelpers.findClassIfExists(clsName, classLoader)
                     if (cls == null) {
                         fw.append("  -> NOT FOUND\n")
-                        Logger.d(TAG, "Candidate not found: $clsName", "候选类未找到：$clsName")
                         continue
                     }
                     fw.append("  -> FOUND\n")
@@ -199,7 +343,6 @@ class HookEntry : IXposedHookLoadPackage {
                     }
                 } catch (t: Throwable) {
                     fw.append("  -> error reading class: ${t.message}\n")
-                    Logger.e(TAG, "error reading $clsName", "读取类出错：$clsName", t)
                 }
             }
             fw.append("\nSystem properties (getprop):\n")
@@ -218,7 +361,7 @@ class HookEntry : IXposedHookLoadPackage {
         }
     }
 
-    // inject overlay (RecyclerView stack) - safe overlay add
+    // ====== Inject Overlay with Duplicate Prevention ======
     private fun injectStackView(activity: Activity, cl: ClassLoader) {
         try {
             Logger.d(TAG, "injectStackView into ${activity.javaClass.name}", "尝试注入到 ${activity.javaClass.name}")
@@ -233,21 +376,10 @@ class HookEntry : IXposedHookLoadPackage {
             val root = inflater.inflate(layoutId, null) as android.widget.FrameLayout
             val rvId = moduleCtx.resources.getIdentifier("stackRecycler", "id", modulePkg)
             val rv = if (rvId != 0) root.findViewById<androidx.recyclerview.widget.RecyclerView>(rvId) else null
-            activity.runOnUiThread {
-                try {
-                    val decor = activity.window?.decorView as? android.view.ViewGroup
-                    if (decor != null) {
-                        val lp = android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
-                        decor.addView(root, lp)
-                        Logger.d(TAG, "overlay added to decor", "已把 overlay 添加到 decor")
-                    } else {
-                        activity.setContentView(root)
-                        Logger.d(TAG, "setContentView used", "使用 setContentView")
-                    }
-                } catch (t: Throwable) {
-                    Logger.e(TAG, "ui attach error: ${t.message}", "界面附加错误: ${t.message}", t)
-                }
-            }
+
+            // Use safe overlay attach
+            attachOverlaySafely(activity, root)
+
             try {
                 rv?.layoutManager = StackLayoutManager(activity)
                 val tasks = fetchTasksFallback(activity)
@@ -260,7 +392,49 @@ class HookEntry : IXposedHookLoadPackage {
         }
     }
 
-    // fallback to ActivityManager appTasks - safe
+    // ====== Safe Overlay Attach (prevents duplicates) ======
+    private fun attachOverlaySafely(activity: Activity, root: View) {
+        try {
+            activity.runOnUiThread {
+                try {
+                    val decor = activity.window?.decorView as? ViewGroup
+                    if (decor != null) {
+                        var existing: View? = null
+                        for (i in 0 until decor.childCount) {
+                            val c = decor.getChildAt(i)
+                            try {
+                                val t = c.tag
+                                if (t is String && t == "RecentsStackOverlay") {
+                                    existing = c; break
+                                }
+                            } catch (_: Throwable) {}
+                        }
+                        if (existing != null) {
+                            Logger.d(TAG, "overlay-exists", "Overlay already present, skipping add")
+                        } else {
+                            try {
+                                root.tag = "RecentsStackOverlay"
+                                val lp = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                                decor.addView(root, lp)
+                                Logger.d(TAG, "overlay-added", "Overlay added to decor")
+                            } catch (t: Throwable) {
+                                Logger.e(TAG, "decor.addView failed: ${t.message}", "decor.addView 失败: ${t.message}", t)
+                                try { activity.setContentView(root); Logger.d(TAG, "setContentView used as fallback", "回退使用 setContentView") } catch (_: Throwable) {}
+                            }
+                        }
+                    } else {
+                        try { activity.setContentView(root); Logger.d(TAG, "setContentView used", "使用 setContentView") } catch (t: Throwable) { Logger.e(TAG, "setContentView failed: ${t.message}", "setContentView 失败: ${t.message}", t) }
+                    }
+                } catch (t: Throwable) {
+                    Logger.e(TAG, "ui attach error: ${t.message}", "界面附加错误: ${t.message}", t)
+                }
+            }
+        } catch (t: Throwable) {
+            Logger.e(TAG, "attachOverlaySafely outer error: ${t.message}", "attachOverlaySafely 总体错误: ${t.message}", t)
+        }
+    }
+
+    // ====== Fallback Task Fetch ======
     private fun fetchTasksFallback(ctx: Context): List<RecentTaskStub> {
         val out = ArrayList<RecentTaskStub>()
         try {
@@ -278,7 +452,7 @@ class HookEntry : IXposedHookLoadPackage {
         return out
     }
 
-    // try to find Context inside an object (helper)
+    // ====== Helper: Find Context in Object ======
     private fun findContextFromObject(obj: Any?): Context? {
         try {
             if (obj == null) return null
