@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">RecentsStack</string>
+    <string name="refresh">刷新任务\nRefresh</string>
+    <string name="export">导出日志\nExport</string>
+    <string name="generate_full">生成完整日志\nGenerate Full Log</string>
+    <string name="no_tasks">未检测到 tasks.json（模块可能未注入）。\nNo tasks.json found (module may not be injected).</string>
 </resources>

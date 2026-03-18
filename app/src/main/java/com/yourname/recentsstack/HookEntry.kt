@@ -4,12 +4,6 @@ import android.app.Activity
 import android.app.ActivityManager
 import android.content.Context
 import android.os.Bundle
-import android.os.Environment
-import android.view.LayoutInflater
-import android.view.ViewGroup
-import android.widget.FrameLayout
-import androidx.recyclerview.widget.RecyclerView
-import com.google.gson.Gson
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -17,7 +11,7 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
 import java.io.FileWriter
-import java.lang.reflect.Field
+import java.util.*
 
 class HookEntry : IXposedHookLoadPackage {
 
@@ -31,194 +25,174 @@ class HookEntry : IXposedHookLoadPackage {
             "com.android.systemui.recents.RecentsActivity",
             "com.android.systemui.recents.OverviewActivity"
         )
-        val TASK_LIST_FIELD_CANDIDATES = listOf("mTasks", "mTaskList", "recentTasks", "mRecentTasks")
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
             val pkg = lpparam.packageName
-            if (pkg != "com.android.systemui" && pkg != "com.meizu.systemui") return
-            Logger.d(TAG, "Loaded package: $pkg")
+            if (pkg != "com.android.systemui") return
+            Logger.d(TAG, "Loaded package: $pkg", "已加载包：$pkg")
 
+            // run quick diagnostics and dump to file
+            try {
+                dumpSystemUiDiagnostics(lpparam.classLoader)
+            } catch (t: Throwable) {
+                Logger.e(TAG, "dumpSystemUiDiagnostics failed", "系统诊断导出失败", t)
+            }
+
+            // Hook all activities onResume to catch Recents openings
+            hookAllActivities(lpparam.classLoader)
+        } catch (t: Throwable) {
+            Logger.e(TAG, "handleLoadPackage error: ${t.message}", "加载包处理错误: ${t.message}", t)
+        }
+    }
+
+    /** Write a snapshot of candidate classes, their fields and methods into a timestamped file on sdcard */
+    private fun dumpSystemUiDiagnostics(classLoader: ClassLoader) {
+        val stamp = System.currentTimeMillis()
+        val dir = File("/sdcard/RecentsStack")
+        if (!dir.exists()) dir.mkdirs()
+        val out = File(dir, "systemui_dump_${stamp}.txt")
+        val fw = FileWriter(out, false)
+        try {
+            fw.append("RecentsStack SystemUI Diagnostics\n")
+            fw.append("Time: ${Date()}\n")
+            fw.append("Packages / classes tested:\n")
             for (clsName in RECENTS_CLASS_CANDIDATES) {
+                fw.append("---- Class: ").append(clsName).append("\n")
                 try {
-                    val cls = XposedHelpers.findClassIfExists(clsName, lpparam.classLoader) ?: continue
-                    Logger.d(TAG, "Found candidate: $clsName")
-
-                    val methodNames = listOf("onCreate", "init", "onStart", "start")
-                    for (mname in methodNames) {
+                    val cls = XposedHelpers.findClassIfExists(clsName, classLoader)
+                    if (cls == null) {
+                        fw.append("  -> NOT FOUND\n")
+                        Logger.d(TAG, "Candidate not found: $clsName", "候选类未找到：$clsName")
+                        continue
+                    }
+                    fw.append("  -> FOUND\n")
+                    fw.append("  Declared fields:\n")
+                    for (f in cls.declaredFields) {
                         try {
-                            XposedHelpers.findAndHookMethod(cls, mname, Bundle::class.java, object : XC_MethodHook() {
-                                override fun afterHookedMethod(param: MethodHookParam) {
-                                    try {
-                                        val thisObj = param.thisObject
-                                        if (thisObj is Activity) {
-                                            injectStackView(thisObj, lpparam.classLoader)
-                                        } else {
-                                            val ctx = findContextFromObject(thisObj)
-                                            if (ctx is Activity) injectStackView(ctx, lpparam.classLoader)
-                                        }
-                                    } catch (t: Throwable) { Logger.d(TAG, "afterHook error: ${t.message}") }
-                                }
-                            })
-                            Logger.d(TAG, "Hooked $clsName::$mname")
+                            fw.append("    field: ").append(f.name).append(" : ").append(f.type.simpleName).append("\n")
+                        } catch (_: Throwable) {}
+                    }
+                    fw.append("  Declared methods:\n")
+                    for (m in cls.declaredMethods) {
+                        try {
+                            fw.append("    method: ").append(m.name).append("(")
+                            m.parameterTypes.forEachIndexed { i, p -> if (i > 0) fw.append(","); fw.append(p.simpleName) }
+                            fw.append(")\n")
                         } catch (_: Throwable) {}
                     }
                 } catch (t: Throwable) {
-                    Logger.d(TAG, "hook candidate error: ${t.message}")
+                    fw.append("  -> error reading class: ${t.message}\n")
+                    Logger.e(TAG, "error reading ${clsName}", "读取类出错：$clsName", t)
                 }
             }
-        } catch (t: Throwable) {
-            Logger.d(TAG, "handleLoadPackage error: ${t.message}")
+
+            // Write some basic system props using reflection when possible
+            fw.append("\nSystem properties (getprop):\n")
+            try {
+                val getprop = Class.forName("android.os.SystemProperties")
+                val g = getprop.getMethod("get", String::class.java)
+                listOf("ro.product.model", "ro.build.version.release", "ro.build.version.sdk", "ro.build.fingerprint").forEach { key ->
+                    try {
+                        val v = g.invoke(null, key) as? String
+                        fw.append("  $key = ${v ?: "<null>"}\n")
+                    } catch (_: Throwable) { fw.append("  $key = <err>\n") }
+                }
+            } catch (_: Throwable) { /* ignore */ }
+
+            fw.append("\nEnd of diagnostics\n")
+            fw.flush()
+            Logger.d(TAG, "Wrote systemui diagnostics to ${out.absolutePath}", "已写入系统诊断到 ${out.absolutePath}")
+        } finally {
+            try { fw.close() } catch (_: Throwable) {}
         }
     }
 
+    private fun hookAllActivities(classLoader: ClassLoader) {
+        try {
+            val activityCls = Class.forName("android.app.Activity", false, classLoader)
+            XposedBridge.hookAllMethods(activityCls, "onResume", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    try {
+                        val activity = param.thisObject as? Activity ?: return
+                        val name = activity.javaClass.name
+                        Logger.d(TAG, "Activity resumed: $name", "Activity 恢复: $name")
+                        if (name.contains("recents", true) || name.contains("overview", true) || name.contains("Recent", true)) {
+                            Logger.d(TAG, "HIT Recents Activity: $name", "检测到 Recents Activity: $name")
+                            try {
+                                injectStackView(activity, activity.classLoader)
+                            } catch (t: Throwable) {
+                                Logger.e(TAG, "injectStackView failed: ${t.message}", "注入视图失败: ${t.message}", t)
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        Logger.e(TAG, "onResume hook error: ${t.message}", "onResume 钩子错误: ${t.message}", t)
+                    }
+                }
+            })
+            Logger.d(TAG, "hookAllActivities installed", "已安装 Activity onResume 钩子")
+        } catch (t: Throwable) {
+            Logger.e(TAG, "hookAllActivities error: ${t.message}", "安装 Activity 钩子失败: ${t.message}", t)
+        }
+    }
+
+    // reuse your existing injectStackView logic (ensure it writes logs too)
     private fun injectStackView(activity: Activity, cl: ClassLoader) {
         try {
-            XposedBridge.log("[$TAG] injecting stack view into Activity: ${activity.javaClass.name}")
-            // determine module package dynamically from this class' package
+            Logger.d(TAG, "injectStackView into ${activity.javaClass.name}", "尝试注入到 ${activity.javaClass.name}")
             val modulePkg = this.javaClass.`package`?.name ?: "com.yourname.recentsstack"
             val moduleCtx = try {
                 activity.createPackageContext(modulePkg, Context.CONTEXT_IGNORE_SECURITY)
-            } catch (e: Throwable) {
-                // fallback: try common package
-                try { activity.createPackageContext("com.yourname.recentsstack", Context.CONTEXT_IGNORE_SECURITY) } catch (_: Throwable) { activity }
-            }
-            val inflater = LayoutInflater.from(moduleCtx)
-            val layoutId = moduleCtx.resources.getIdentifier("custom_recents", "layout", modulePkg)
-            if (layoutId == 0) {
-                XposedBridge.log("[$TAG] module layout not found (custom_recents)")
-                return
-            }
-            val root = inflater.inflate(layoutId, null) as FrameLayout
-
-            val rvId = moduleCtx.resources.getIdentifier("stackRecycler", "id", modulePkg)
-            val rv = if (rvId != 0) root.findViewById<RecyclerView>(rvId) else null
-            if (rv == null) {
-                XposedBridge.log("[$TAG] stackRecycler not found in module layout (id=$rvId)")
-                return
-            }
-
-            // attach overlay
+            } catch (_: Throwable) { activity }
+            val inflater = activity.getSystemService(Context.LAYOUT_INFLATER_SERVICE) as android.view.LayoutInflater
+            // try inflate from module if possible
             try {
-                activity.runOnUiThread {
-                    try {
-                        val decor = activity.window?.decorView as? ViewGroup
-                        if (decor != null) {
-                            try {
-                                val lp = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                                decor.addView(root, lp)
-                            } catch (t: Throwable) {
-                                try { activity.setContentView(root) } catch (_: Throwable) {}
+                val layoutId = moduleCtx.resources.getIdentifier("custom_recents", "layout", modulePkg)
+                if (layoutId != 0) {
+                    val root = inflater.inflate(layoutId, null) as android.widget.FrameLayout
+                    val rvId = moduleCtx.resources.getIdentifier("stackRecycler", "id", modulePkg)
+                    val rv = if (rvId != 0) root.findViewById<androidx.recyclerview.widget.RecyclerView>(rvId) else null
+                    activity.runOnUiThread {
+                        try {
+                            val decor = activity.window?.decorView as? android.view.ViewGroup
+                            if (decor != null) {
+                                decor.addView(root, android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT))
+                                Logger.d(TAG, "overlay added to decor", "已把 overlay 添加到 decor")
+                            } else {
+                                activity.setContentView(root)
+                                Logger.d(TAG, "setContentView used", "使用 setContentView")
                             }
-                        } else {
-                            try { activity.setContentView(root) } catch (_: Throwable) {}
+                        } catch (t: Throwable) {
+                            Logger.e(TAG, "ui attach error: ${t.message}", "界面附加错误: ${t.message}", t)
                         }
-                    } catch (t: Throwable) {
-                        XposedBridge.log("[$TAG] UI thread attach error: ${t.message}")
                     }
+                } else {
+                    Logger.d(TAG, "module layout not found for injection", "模块布局未找到")
                 }
             } catch (t: Throwable) {
-                XposedBridge.log("[$TAG] runOnUiThread failed: ${t.message}")
+                Logger.e(TAG, "inflate/attach error: ${t.message}", "inflate/attach 错误: ${t.message}", t)
             }
-
-            rv.layoutManager = StackLayoutManager(activity)
-            val tasks = fetchTasks(activity, cl)
-            rv.adapter = RecentsStackAdapter(tasks)
-            XposedBridge.log("[$TAG] injected RecyclerView with ${tasks.size} tasks")
-            dumpTasks(tasks)
-        } catch (t: Throwable) { Logger.d(TAG, "injectStackView err: ${t.message}") }
+        } catch (t: Throwable) {
+            Logger.e(TAG, "injectStackView general error: ${t.message}", "注入总体错误: ${t.message}", t)
+        }
     }
 
-    private fun dumpTasks(tasks: List<RecentTaskStub>) {
-        try {
-            val dir = File(Environment.getExternalStorageDirectory(), "RecentsStack")
-            if (!dir.exists()) dir.mkdirs()
-            val tf = File(dir, "tasks.json")
-            val fw = FileWriter(tf, false)
-            fw.write(Gson().toJson(tasks))
-            fw.flush(); fw.close()
-        } catch (t: Throwable) { Logger.d(TAG, "dumpTasks err: ${t.message}") }
-    }
-
-    private fun fetchTasks(ctx: Context, classLoader: ClassLoader): List<RecentTaskStub> {
-        try {
-            for (clsName in RECENTS_CLASS_CANDIDATES) {
-                try {
-                    val cls = XposedHelpers.findClassIfExists(clsName, classLoader) ?: continue
-                    for (f in cls.declaredFields) {
-                        try {
-                            f.isAccessible = true
-                            val valObj = f.get(null)
-                            if (valObj is Collection<*>) {
-                                Logger.d(TAG, "Found static collection ${f.name} in $clsName")
-                                return convertToStub(valObj)
-                            }
-                        } catch (_: Throwable) {}
-                    }
-                } catch (_: Throwable) {}
-            }
-        } catch (t: Throwable) { Logger.d(TAG, "reflection strategy1 err: ${t.message}") }
-
+    // convert fallback fetch if needed (kept minimal to avoid crashes)
+    private fun fetchTasksFallback(ctx: Context): List<RecentTaskStub> {
+        val out = ArrayList<RecentTaskStub>()
         try {
             val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            val out = ArrayList<RecentTaskStub>()
-            try {
-                val appTasks = am.appTasks
-                for (at in appTasks) {
-                    try {
-                        val info = at.taskInfo
-                        val pkg = info.baseIntent?.component?.packageName ?: (info.topActivity?.packageName ?: "unknown")
-                        val cls = info.baseIntent?.component?.className ?: (info.topActivity?.className ?: "")
-                        out.add(RecentTaskStub(pkg, cls, pkg, null))
-                    } catch (_: Throwable) {}
-                }
-                if (out.isNotEmpty()) { Logger.d(TAG, "ActivityManager returned ${out.size} tasks"); return out }
-            } catch (t: Throwable) { Logger.d(TAG, "ActivityManager.appTasks err: ${t.message}") }
-        } catch (t: Throwable) { Logger.d(TAG, "AM fetch err: ${t.message}") }
-
-        return emptyList()
-    }
-
-    private fun convertToStub(col: Collection<*>?): List<RecentTaskStub> {
-        val out = ArrayList<RecentTaskStub>()
-        if (col == null) return out
-        for (it in col) {
-            if (it == null) continue
-            try {
-                var pkg = ""
-                var title = ""
+            val appTasks = am.appTasks
+            for (at in appTasks) {
                 try {
-                    val pn = safeFindField(it.javaClass, "packageName", "pkg", "package")
-                    if (pn != null) { val v = pn.get(it); if (v is String) pkg = v }
+                    val info = at.taskInfo
+                    val pkg = info.baseIntent?.component?.packageName ?: (info.topActivity?.packageName ?: "unknown")
+                    val cls = info.baseIntent?.component?.className ?: (info.topActivity?.className ?: "")
+                    out.add(RecentTaskStub(pkg, cls, pkg, null))
                 } catch (_: Throwable) {}
-                try {
-                    val t = safeFindField(it.javaClass, "title", "label")
-                    if (t != null) { val v = t.get(it); if (v is String) title = v }
-                } catch (_: Throwable) {}
-                out.add(RecentTaskStub(if (pkg.isNotBlank()) pkg else "unknown", "", if (title.isNotBlank()) title else pkg, null))
-            } catch (_: Throwable) {}
-        }
-        return out
-    }
-
-    private fun safeFindField(cls: Class<*>, vararg names: String): Field? {
-        for (n in names) {
-            try {
-                val f = cls.getDeclaredField(n)
-                f.isAccessible = true
-                return f
-            } catch (_: Throwable) {}
-        }
-        return null
-    }
-
-    private fun findContextFromObject(obj: Any): Context? {
-        try {
-            for (f in obj.javaClass.declaredFields) {
-                try { f.isAccessible = true; val v = f.get(obj); if (v is Context) return v } catch (_: Throwable) {}
             }
         } catch (_: Throwable) {}
-        return null
+        return out
     }
 }

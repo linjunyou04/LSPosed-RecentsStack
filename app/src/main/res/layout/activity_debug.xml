@@ -1,9 +1,59 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:orientation="vertical" android:layout_width="match_parent" android:layout_height="match_parent" android:padding="12dp">
-    <TextView android:id="@+id/info_tv" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Info" />
-    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
-        <Button android:id="@+id/refresh_btn" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="刷新任务" />
-        <Button android:id="@+id/export_btn" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="导出日志" />
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="vertical" android:layout_width="match_parent" android:layout_height="match_parent"
+    android:padding="16dp" android:background="#121212">
+
+    <TextView
+        android:id="@+id/info_tv"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="RecentsStack 调试面板\n（中文 / English）"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:padding="8dp" />
+
+    <LinearLayout
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal"
+        android:layout_marginTop="8dp">
+
+        <Button
+            android:id="@+id/refresh_btn"
+            android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+            android:text="刷新任务\nRefresh" />
+
+        <Button
+            android:id="@+id/genfull_btn"
+            android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+            android:text="生成完整日志\nGenerate Full Log"
+            android:layout_marginStart="8dp" />
     </LinearLayout>
-    <androidx.recyclerview.widget.RecyclerView android:id="@+id/debug_rv" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" />
+
+    <LinearLayout
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal"
+        android:layout_marginTop="8dp">
+        <Button
+            android:id="@+id/export_btn"
+            android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+            android:text="导出日志\nExport Logs" />
+
+        <View android:layout_width="8dp" android:layout_height="1dp" />
+    </LinearLayout>
+
+    <View android:layout_width="match_parent" android:layout_height="8dp" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/debug_rv"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#1E1E1E" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="提示：请确保 LSPosed 模块已启用并重启 SystemUI。"
+        android:textColor="#CCCCCC"
+        android:paddingTop="8dp"
+        android:textSize="12sp" />
+
 </LinearLayout>
