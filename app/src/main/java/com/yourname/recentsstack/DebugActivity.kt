@@ -1,12 +1,18 @@
 package com.yourname.recentsstack
 
+import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.widget.Button
 import android.widget.TextView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.gson.Gson
@@ -17,6 +23,7 @@ class DebugActivity : Activity() {
     private lateinit var rv: RecyclerView
     private lateinit var exportBtn: Button
     private lateinit var refreshBtn: Button
+    private val REQ_READ_EXT = 1001
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,21 +38,48 @@ class DebugActivity : Activity() {
         refreshBtn.setOnClickListener { loadTasks() }
         exportBtn.setOnClickListener { exportLogs() }
 
+        // Request permission if needed (Android 6+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), REQ_READ_EXT)
+            }
+        }
+
         loadTasks()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_READ_EXT) {
+            loadTasks()
+        }
     }
 
     private fun loadTasks() {
         val dir = File(Environment.getExternalStorageDirectory(), "RecentsStack")
         val tf = File(dir, "tasks.json")
         if (!tf.exists()) {
-            infoTv.text = "tasks.json not found. Make sure module injected and has permission."
+            infoTv.text = "tasks.json not found.\nMake sure module injected and has permission."
             rv.adapter = RecentsStackAdapter(emptyList())
             return
         }
-        val text = tf.readText()
-        val arr = Gson().fromJson(text, Array<RecentTaskStub>::class.java).toList()
-        infoTv.text = "Loaded ${arr.size} tasks from tasks.json"
-        rv.adapter = RecentsStackAdapter(arr)
+
+        try {
+            val text = tf.readText()
+            val arr = try {
+                Gson().fromJson(text, Array<RecentTaskStub>::class.java)?.toList() ?: emptyList()
+            } catch (e: Exception) {
+                infoTv.text = "tasks.json parse error: ${e.message}"
+                rv.adapter = RecentsStackAdapter(emptyList())
+                return
+            }
+
+            infoTv.text = "Loaded ${arr.size} tasks from tasks.json"
+            rv.adapter = RecentsStackAdapter(arr)
+        } catch (e: Exception) {
+            infoTv.text = "Load error: ${e.message}"
+            rv.adapter = RecentsStackAdapter(emptyList())
+        }
     }
 
     private fun exportLogs() {
@@ -55,10 +89,16 @@ class DebugActivity : Activity() {
             infoTv.text = "log.txt not found"
             return
         }
-        val uri = Uri.fromFile(lf)
-        val share = Intent(Intent.ACTION_SEND)
-        share.type = "text/plain"
-        share.putExtra(Intent.EXTRA_STREAM, uri)
-        startActivity(Intent.createChooser(share, "Share logs"))
+        try {
+            val authority = "${applicationContext.packageName}.fileprovider"
+            val uri: Uri = FileProvider.getUriForFile(this, authority, lf)
+            val share = Intent(Intent.ACTION_SEND)
+            share.type = "text/plain"
+            share.putExtra(Intent.EXTRA_STREAM, uri)
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(share, "Share logs"))
+        } catch (e: Exception) {
+            infoTv.text = "Export failed: ${e.message}"
+        }
     }
 }

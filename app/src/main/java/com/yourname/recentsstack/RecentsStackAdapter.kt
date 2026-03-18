@@ -14,8 +14,9 @@ class RecentsStackAdapter(private val tasks: List<RecentTaskStub>) : RecyclerVie
 
     override fun onBindViewHolder(holder: VH, position: Int) {
         val t = tasks[position]
-        holder.title.text = t.title
-        holder.pkg.text = t.packageName
+        val title = if (!t.title.isNullOrBlank()) t.title else t.packageName
+        holder.title.text = title ?: "Unknown"
+        holder.pkg.text = t.packageName ?: ""
     }
 
     override fun getItemCount(): Int = tasks.size

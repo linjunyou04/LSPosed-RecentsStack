@@ -12,6 +12,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.gson.Gson
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
@@ -30,7 +31,7 @@ class HookEntry : IXposedHookLoadPackage {
             "com.android.systemui.recents.RecentsActivity",
             "com.android.systemui.recents.OverviewActivity"
         )
-        const val MODULE_PKG = "com.yourname.recentsstack"
+        val TASK_LIST_FIELD_CANDIDATES = listOf("mTasks", "mTaskList", "recentTasks", "mRecentTasks")
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -74,24 +75,57 @@ class HookEntry : IXposedHookLoadPackage {
 
     private fun injectStackView(activity: Activity, cl: ClassLoader) {
         try {
-            Logger.d(TAG, "injecting into ${activity.javaClass.name}")
-            val moduleCtx = activity.createPackageContext(MODULE_PKG, Context.CONTEXT_IGNORE_SECURITY)
+            XposedBridge.log("[$TAG] injecting stack view into Activity: ${activity.javaClass.name}")
+            // determine module package dynamically from this class' package
+            val modulePkg = this.javaClass.`package`?.name ?: "com.yourname.recentsstack"
+            val moduleCtx = try {
+                activity.createPackageContext(modulePkg, Context.CONTEXT_IGNORE_SECURITY)
+            } catch (e: Throwable) {
+                // fallback: try common package
+                try { activity.createPackageContext("com.yourname.recentsstack", Context.CONTEXT_IGNORE_SECURITY) } catch (_: Throwable) { activity }
+            }
             val inflater = LayoutInflater.from(moduleCtx)
-            val root = inflater.inflate(moduleCtx.resources.getIdentifier("custom_recents", "layout", MODULE_PKG), null) as FrameLayout
-            val rv = root.findViewById<RecyclerView>(moduleCtx.resources.getIdentifier("stackRecycler", "id", MODULE_PKG))
-            if (rv == null) { Logger.d(TAG, "stackRecycler not found in module layout"); return }
+            val layoutId = moduleCtx.resources.getIdentifier("custom_recents", "layout", modulePkg)
+            if (layoutId == 0) {
+                XposedBridge.log("[$TAG] module layout not found (custom_recents)")
+                return
+            }
+            val root = inflater.inflate(layoutId, null) as FrameLayout
 
-            activity.runOnUiThread {
-                try {
-                    val decor = activity.window?.decorView as? ViewGroup
-                    if (decor != null) decor.addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-                    else activity.setContentView(root)
-                } catch (t: Throwable) { Logger.d(TAG, "attach error: ${t.message}") }
+            val rvId = moduleCtx.resources.getIdentifier("stackRecycler", "id", modulePkg)
+            val rv = if (rvId != 0) root.findViewById<RecyclerView>(rvId) else null
+            if (rv == null) {
+                XposedBridge.log("[$TAG] stackRecycler not found in module layout (id=$rvId)")
+                return
+            }
+
+            // attach overlay
+            try {
+                activity.runOnUiThread {
+                    try {
+                        val decor = activity.window?.decorView as? ViewGroup
+                        if (decor != null) {
+                            try {
+                                val lp = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                                decor.addView(root, lp)
+                            } catch (t: Throwable) {
+                                try { activity.setContentView(root) } catch (_: Throwable) {}
+                            }
+                        } else {
+                            try { activity.setContentView(root) } catch (_: Throwable) {}
+                        }
+                    } catch (t: Throwable) {
+                        XposedBridge.log("[$TAG] UI thread attach error: ${t.message}")
+                    }
+                }
+            } catch (t: Throwable) {
+                XposedBridge.log("[$TAG] runOnUiThread failed: ${t.message}")
             }
 
             rv.layoutManager = StackLayoutManager(activity)
             val tasks = fetchTasks(activity, cl)
             rv.adapter = RecentsStackAdapter(tasks)
+            XposedBridge.log("[$TAG] injected RecyclerView with ${tasks.size} tasks")
             dumpTasks(tasks)
         } catch (t: Throwable) { Logger.d(TAG, "injectStackView err: ${t.message}") }
     }
