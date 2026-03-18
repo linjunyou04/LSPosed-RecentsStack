@@ -1,0 +1,1093 @@
+// File: app/src/main/java/com/yourname/recentsstack/HookEntry.kt
+package com.yourname.recentsstack
+
+import android.app.Activity
+import android.app.ActivityManager
+import android.content.Context
+import android.view.View
+import android.view.ViewGroup
+import com.google.gson.Gson
+import de.robv.android.xposed.IXposedHookLoadPackage
+import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
+import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.io.File
+import java.io.FileWriter
+import java.lang.reflect.Method
+import java.util.*
+import kotlin.collections.ArrayList
+import kotlin.collections.HashMap
+
+class HookEntry : IXposedHookLoadPackage {
+
+    companion object {
+        const val TAG = "RecentsStack"
+    }
+
+    // throttles & limits
+    private val lastDumpForActivity = HashMap<String, Long>()
+    private val DUMP_MIN_INTERVAL_MS = 1200L
+    private val MAX_FULL_LOG_BYTES = 3 * 1024 * 1024L // 3MB
+
+    override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+        try {
+            val pkg = lpparam.packageName
+            if (pkg != "com.android.systemui" && pkg != "com.meizu.systemui") return
+
+            Logger.d(TAG, "HOOK", "SystemUI injected", "SystemUI 注入")
+
+            // ensure folder & marker (guarantee visible to DebugActivity)
+            try {
+                val dir = File("/sdcard/RecentsStack")
+                if (!dir.exists()) dir.mkdirs()
+                File(dir, "injected.flag").writeText("ok")
+            } catch (_: Throwable) {}
+
+            try { dumpSystemUiDiagnostics(lpparam.classLoader) } catch (t: Throwable) { Logger.e(TAG, "dump diagnostics failed: ${t.message}", "诊断导出失败: ${t.message}", t) }
+
+            try { forceWriteTasksJson(lpparam.classLoader) } catch (_: Throwable) {}
+
+            installGlobalCapture(lpparam.classLoader)
+            addRobustMethodHooks(lpparam.classLoader)
+
+        } catch (t: Throwable) {
+            Logger.e(TAG, "handleLoadPackage error: ${t.message}", "加载包错误: ${t.message}", t)
+        }
+    }
+
+    private fun forceWriteTasksJson(classLoader: ClassLoader) {
+        try {
+            val dir = File("/sdcard/RecentsStack")
+            if (!dir.exists()) dir.mkdirs()
+            val tf = File(dir, "tasks.json")
+
+            val stubs = LinkedHashSet<RecentTaskStub>()
+
+            // Strategy: try to use ActivityManagerService via reflection (best-effort)
+            try {
+                val amClass = Class.forName("android.app.ActivityManager", false, classLoader)
+                val service = try { XposedHelpers.callStaticMethod(amClass, "getService") } catch (_: Throwable) { null }
+                if (service != null) {
+                    try {
+                        val getRecent = service.javaClass.getMethod("getRecentTasks", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                        val list = getRecent.invoke(service, 50, 0) as? List<*>
+                        if (!list.isNullOrEmpty()) {
+                            for (item in list) {
+                                try {
+                                    var pkg = "unknown"; var cls = ""
+                                    try {
+                                        val baseIntent = try { XposedHelpers.getObjectField(item, "baseIntent") } catch (_: Throwable) { null }
+                                        if (baseIntent != null) {
+                                            val comp = try { baseIntent.javaClass.getMethod("getComponent").invoke(baseIntent) } catch (_: Throwable) { null }
+                                            if (comp != null) {
+                                                pkg = try { comp.javaClass.getMethod("getPackageName").invoke(comp) as? String ?: "unknown" } catch (_: Throwable) { "unknown" }
+                                                cls = try { comp.javaClass.getMethod("getClassName").invoke(comp) as? String ?: "" } catch (_: Throwable) { "" }
+                                            }
+                                        }
+                                    } catch (_: Throwable) {}
+                                    try {
+                                        val topActivity = try { XposedHelpers.getObjectField(item, "topActivity") } catch (_: Throwable) { null }
+                                        if (topActivity != null && (pkg == "unknown" || cls.isBlank())) {
+                                            pkg = try { topActivity.javaClass.getMethod("getPackageName").invoke(topActivity) as? String ?: pkg } catch (_: Throwable) { pkg }
+                                            cls = try { topActivity.javaClass.getMethod("getClassName").invoke(topActivity) as? String ?: cls } catch (_: Throwable) { cls }
+                                        }
+                                    } catch (_: Throwable) {}
+                                    stubs.add(RecentTaskStub(pkg, cls, pkg, null))
+                                } catch (_: Throwable) {}
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
+            } catch (_: Throwable) {}
+
+            // Strategy fallback: nothing more guaranteed here; we will always write an (possibly empty) tasks.json
+            val gson = Gson()
+            val listJson = gson.toJson(stubs.toList())
+
+            try {
+                tf.writeText(listJson)
+            } catch (t: Throwable) {
+                try {
+                    val f2 = File("/data/local/tmp/tasks.json")
+                    if (!f2.parentFile.exists()) f2.parentFile.mkdirs()
+                    f2.writeText(listJson)
+                } catch (_: Throwable) {}
+            }
+
+            Logger.d(TAG, "FORCE_TASK_WRITE", "Wrote tasks.json (items=${stubs.size})", "写 tasks.json 成功 (数量=${stubs.size})")
+            appendFullLogSafe("FORCE_TASK_WRITE: wrote ${stubs.size} entries\n")
+
+        } catch (t: Throwable) {
+            Logger.e(TAG, "forceWriteTasksJson failed: ${t.message}", "强制写 tasks.json 失败: ${t.message}", t)
+        }
+    }
+
+    private fun installGlobalCapture(classLoader: ClassLoader) {
+        try {
+            Logger.d(TAG, "installGlobalCapture start", "开始安装全局捕获")
+
+            // Activity.onResume
+            try {
+                val activityCls = Class.forName("android.app.Activity", false, classLoader)
+                XposedBridge.hookAllMethods(activityCls, "onResume", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val act = param.thisObject as? Activity ?: return
+                            val name = act.javaClass.name
+                            Logger.d(TAG, "ACTIVITY_RESUME", "Activity resumed: $name", "Activity 恢复: $name")
+
+                            val now = System.currentTimeMillis()
+                            val last = lastDumpForActivity[name] ?: 0L
+                            if (now - last >= DUMP_MIN_INTERVAL_MS) {
+                                lastDumpForActivity[name] = now
+                                appendFullLogSafe("\n=== Activity Resume: $name @ $now ===\n")
+                                dumpViewTree(act)
+                                tryDumpTasks(act)
+                            } else {
+                                Logger.d(TAG, "ACTIVITY_RESUME_THROTTLE", "Throttled dump for $name")
+                            }
+                        } catch (t: Throwable) {
+                            Logger.e(TAG, "onResume hook err: ${t.message}", "onResume 错误: ${t.message}", t)
+                        }
+                    }
+                })
+            } catch (t: Throwable) {
+                Logger.e(TAG, "installGlobalCapture hook Activity failed: ${t.message}", "安装 Activity 钩子失败: ${t.message}", t)
+            }
+
+            // WindowManagerGlobal.addView
+            try {
+                val wmgCls = Class.forName("android.view.WindowManagerGlobal", false, classLoader)
+                for (m in wmgCls.declaredMethods) {
+                    if (m.name == "addView") {
+                        try {
+                            XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                                override fun beforeHookedMethod(param: MethodHookParam) {
+                                    try {
+                                        val viewObj = param.args?.getOrNull(0)
+                                        val viewClass = viewObj?.javaClass?.name ?: "<null>"
+                                        Logger.d(TAG, "ADD_VIEW", "WindowManagerGlobal.addView: $viewClass", "添加顶层 View: $viewClass")
+                                        appendFullLogSafe("=== addView: $viewClass ===\n")
+                                    } catch (_: Throwable) {}
+                                }
+                            })
+                        } catch (t: Throwable) {
+                            Logger.e(TAG, "hook addView method failed: ${t.message}", "addView 钩子失败: ${t.message}", t)
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                Logger.e(TAG, "installGlobalCapture hook addView failed: ${t.message}", "安装 addView 钩子失败: ${t.message}", t)
+            }
+
+            // View.onAttachedToWindow
+            try {
+                val viewCls = Class.forName("android.view.View", false, classLoader)
+                XposedBridge.hookAllMethods(viewCls, "onAttachedToWindow", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val v = param.thisObject as? View ?: return
+                            val clsName = v.javaClass.name
+                            if (clsName.contains("recents", true) || clsName.contains("overview", true) || clsName.contains("task", true)) {
+                                Logger.d(TAG, "RECENTS_VIEW_ATTACH", "View attached: $clsName", "相关视图挂载: $clsName")
+                                appendFullLogSafe("=== RecentsViewAttached: $clsName ===\n")
+                                val ctx = findContextFromObject(v)
+                                if (ctx is Activity) {
+                                    dumpViewTree(ctx)
+                                    tryDumpTasks(ctx)
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            Logger.e(TAG, "onAttachedToWindow hook err: ${t.message}", "onAttachedToWindow 错误: ${t.message}", t)
+                        }
+                    }
+                })
+            } catch (t: Throwable) {
+                Logger.e(TAG, "installGlobalCapture hook View failed: ${t.message}", "安装 View 钩子失败: ${t.message}", t)
+            }
+
+            Logger.d(TAG, "installGlobalCapture done", "全局捕获完成")
+        } catch (t: Throwable) {
+            Logger.e(TAG, "installGlobalCapture general error: ${t.message}", "全局捕获总体错误: ${t.message}", t)
+        }
+    }
+
+    private fun addRobustMethodHooks(classLoader: ClassLoader) {
+        try {
+            val candidates = listOf(
+                "com.android.systemui.recents.RecentsImplementation",
+                "com.android.systemui.recents.OverviewProxyRecentsImpl",
+                "com.android.systemui.recents.LauncherProxyService",
+                "com.android.systemui.statusbar.CommandQueue"
+            )
+            val pattern = Regex("(?i).*(show|toggle|recent|overview|notify|preload|notifyToggle).*")
+            var hooked = 0
+
+            for (clsName in candidates) {
+                try {
+                    val cls = XposedHelpers.findClassIfExists(clsName, classLoader)
+                    if (cls == null) {
+                        Logger.d(TAG, "candidate-missing", "Candidate not found: $clsName")
+                        continue
+                    }
+                    Logger.d(TAG, "candidate-found", "Found candidate: $clsName")
+
+                    for (m in cls.declaredMethods) {
+                        try {
+                            val name = m.name
+                            if (pattern.matches(name)) {
+                                try {
+                                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                                        override fun beforeHookedMethod(param: MethodHookParam) {
+                                            try {
+                                                Logger.d(TAG, "method-before", "$clsName.$name BEFORE")
+                                                appendFullLogSafe("BEFORE METHOD: $clsName.$name this=${param.thisObject?.javaClass?.name}\n")
+                                            } catch (_: Throwable) {}
+                                        }
+                                        override fun afterHookedMethod(param: MethodHookParam) {
+                                            try {
+                                                Logger.d(TAG, "method-after", "$clsName.$name AFTER")
+                                                appendFullLogSafe("AFTER METHOD: $clsName.$name this=${param.thisObject?.javaClass?.name}\n")
+                                                val ctx = findContextFromObject(param.thisObject) ?: (param.thisObject as? Activity)
+                                                if (ctx is Activity) {
+                                                    tryDumpTasks(ctx)
+                                                    injectStackView(ctx, classLoader)
+                                                }
+                                            } catch (t: Throwable) {
+                                                Logger.e(TAG, "method-hook-after err: ${t.message}", "方法钩子后错误: ${t.message}", t)
+                                            }
+                                        }
+                                    })
+                                    hooked++
+                                } catch (t: Throwable) {
+                                    Logger.e(TAG, "hookMethod failed: ${t.message}", "hookMethod 失败: ${t.message}", t)
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                } catch (t: Throwable) {
+                    Logger.e(TAG, "candidate loop error: ${t.message}", "候选循环错误: ${t.message}", t)
+                }
+            }
+            Logger.d(TAG, "method-hook-summary", "hooked methods approx: $hooked")
+            appendFullLogSafe("HOOK SUMMARY: hooked methods approx: $hooked\n")
+        } catch (t: Throwable) {
+            Logger.e(TAG, "addRobustMethodHooks failed: ${t.message}", "添加方法钩子失败: ${t.message}", t)
+        }
+    }
+
+    private fun tryDumpTasks(ctx: Context?) {
+        try {
+            val tasks = fetchTasksBestEffort(ctx)
+            val dir = File("/sdcard/RecentsStack")
+            if (!dir.exists()) dir.mkdirs()
+            val tf = File(dir, "tasks.json")
+            val gson = Gson()
+            tf.writeText(gson.toJson(tasks))
+            Logger.d(TAG, "TASK_DUMP", "tasks.json written: ${tasks.size}", "写入 tasks.json 条目: ${tasks.size}")
+            appendFullLogSafe("TASKS_WRITTEN: ${tasks.size}\n")
+        } catch (t: Throwable) {
+            Logger.e(TAG, "tryDumpTasks failed: ${t.message}", "写 tasks.json 失败: ${t.message}", t)
+        }
+    }
+
+    private fun fetchTasksBestEffort(ctx: Context?): List<RecentTaskStub> {
+        val out = ArrayList<RecentTaskStub>()
+
+        try {
+            if (ctx is Activity) {
+                val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                val appTasks = try { am.appTasks } catch (_: Throwable) { null }
+                if (appTasks != null && appTasks.isNotEmpty()) {
+                    for (at in appTasks) {
+                        try {
+                            val info = at.taskInfo
+                            val pkg = info.baseIntent?.component?.packageName ?: (info.topActivity?.packageName ?: "unknown")
+                            val cls = info.baseIntent?.component?.className ?: (info.topActivity?.className ?: "")
+                            out.add(RecentTaskStub(pkg, cls, pkg, null))
+                        } catch (_: Throwable) {}
+                    }
+                    if (out.isNotEmpty()) return out
+                }
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            val amClass = Class.forName("android.app.ActivityManager", false, this::class.java.classLoader)
+            val service = try { XposedHelpers.callStaticMethod(amClass, "getService") } catch (_: Throwable) { null }
+            if (service != null) {
+                try {
+                    val getRecent = service.javaClass.getMethod("getRecentTasks", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    val list = getRecent.invoke(service, 50, 0) as? List<*>
+                    if (!list.isNullOrEmpty()) {
+                        for (item in list) {
+                            try {
+                                var pkg = "unknown"; var cls = ""
+                                try {
+                                    val baseIntent = try { XposedHelpers.getObjectField(item, "baseIntent") } catch (_: Throwable) { null }
+                                    if (baseIntent != null) {
+                                        val comp = try { baseIntent.javaClass.getMethod("getComponent").invoke(baseIntent) } catch (_: Throwable) { null }
+                                        if (comp != null) {
+                                            pkg = try { comp.javaClass.getMethod("getPackageName").invoke(comp) as? String ?: "unknown" } catch (_: Throwable) { "unknown" }
+                                            cls = try { comp.javaClass.getMethod("getClassName").invoke(comp) as? String ?: "" } catch (_: Throwable) { "" }
+                                        }
+                                    }
+                                } catch (_: Throwable) {}
+                                try {
+                                    val topActivity = try { XposedHelpers.getObjectField(item, "topActivity") } catch (_: Throwable) { null }
+                                    if (topActivity != null && (pkg == "unknown" || cls.isBlank())) {
+                                        pkg = try { topActivity.javaClass.getMethod("getPackageName").invoke(topActivity) as? String ?: pkg } catch (_: Throwable) { pkg }
+                                        cls = try { topActivity.javaClass.getMethod("getClassName").invoke(topActivity) as? String ?: cls } catch (_: Throwable) { cls }
+                                    }
+                                } catch (_: Throwable) {}
+                                out.add(RecentTaskStub(pkg, cls, pkg, null))
+                            } catch (_: Throwable) {}
+                        }
+                        if (out.isNotEmpty()) return out
+                    }
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            if (ctx != null) {
+                val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                @Suppress("DEPRECATION")
+                val recent = try { am.getRunningTasks(50) } catch (_: Throwable) { null }
+                if (!recent.isNullOrEmpty()) {
+                    for (t in recent) {
+                        try {
+                            val pkg = t.topActivity?.packageName ?: "unknown"
+                            val cls = t.topActivity?.className ?: ""
+                            out.add(RecentTaskStub(pkg, cls, pkg, null))
+                        } catch (_: Throwable) {}
+                    }
+                    if (out.isNotEmpty()) return out
+                }
+            }
+        } catch (_: Throwable) {}
+
+        return out
+    }
+
+    private fun dumpViewTree(activity: Activity) {
+        try {
+            val decor = activity.window?.decorView as? ViewGroup ?: return
+            val sb = StringBuilder()
+            sb.append("\n=== ViewTree for ").append(activity.javaClass.name).append(" ===\n")
+            fun dfs(v: View, depth: Int) {
+                repeat(depth) { sb.append("  ") }
+                sb.append(v.javaClass.name)
+                val idName = try {
+                    if (v.id != View.NO_ID) activity.resources.getResourceEntryName(v.id) else null
+                } catch (_: Throwable) { null }
+                if (!idName.isNullOrBlank()) sb.append(" #").append(idName)
+                sb.append("\n")
+                if (v is ViewGroup) {
+                    for (i in 0 until v.childCount) {
+                        try { dfs(v.getChildAt(i), depth + 1) } catch (_: Throwable) {}
+                    }
+                }
+            }
+            dfs(decor, 0)
+            sb.append("=== End ViewTree ===\n")
+            appendFullLogSafe(sb.toString())
+        } catch (t: Throwable) {
+            Logger.e(TAG, "dumpViewTree err: ${t.message}", "View树 dump 错误: ${t.message}", t)
+        }
+    }
+
+    private fun appendFullLogSafe(text: String) {
+        try {
+            val dir = File("/sdcard/RecentsStack")
+            if (!dir.exists()) dir.mkdirs()
+            val full = File(dir, "full_log.txt")
+            if (full.exists() && full.length() > MAX_FULL_LOG_BYTES) {
+                try {
+                    val rotated = File(dir, "full_log_${System.currentTimeMillis()}.txt")
+                    full.renameTo(rotated)
+                    full.writeText("")
+                } catch (_: Throwable) {}
+            }
+            full.appendText(text)
+        } catch (e: Throwable) {
+            try {
+                val f2 = File("/data/local/tmp/full_log.txt")
+                if (!f2.parentFile.exists()) f2.parentFile.mkdirs()
+                f2.appendText(text)
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun findContextFromObject(obj: Any?): Context? {
+        if (obj == null) return null
+        try {
+            if (obj is Context) return obj
+            var cls: Class<*>? = obj.javaClass
+            var depth = 0
+            while (cls != null && depth++ < 4) {
+                for (f in cls.declaredFields) {
+                    try {
+                        f.isAccessible = true
+                        val v = f.get(obj)
+                        if (v is Context) return v
+                        if (v != null && v.javaClass.name.contains("Context", true)) return v as? Context
+                    } catch (_: Throwable) {}
+                }
+                cls = cls.superclass
+            }
+        } catch (_: Throwable) {}
+        return null
+    }
+
+    private fun injectStackView(activity: Activity, cl: ClassLoader) {
+        try {
+            Logger.d(TAG, "injectStackView", "Attempt inject overlay into ${activity.javaClass.name}", "尝试注入 overlay 到 ${activity.javaClass.name}")
+            val modulePkg = this.javaClass.packageName
+            val moduleCtx = try { activity.createPackageContext(modulePkg, Context.CONTEXT_IGNORE_SECURITY) } catch (_: Throwable) { activity }
+            val inflater = activity.layoutInflater
+            val layoutId = moduleCtx.resources.getIdentifier("custom_recents", "layout", modulePkg)
+            if (layoutId == 0) {
+                Logger.d(TAG, "module layout not found", "模块布局未找到")
+                return
+            }
+            val root = inflater.inflate(layoutId, null) as android.widget.FrameLayout
+            try {
+                val rvId = moduleCtx.resources.getIdentifier("stackRecycler", "id", modulePkg)
+                val rv = if (rvId != 0) root.findViewById<androidx.recyclerview.widget.RecyclerView>(rvId) else null
+                rv?.layoutManager = StackLayoutManager(activity)
+                val tasks = fetchTasksBestEffort(activity)
+                rv?.adapter = RecentsStackAdapter(tasks)
+            } catch (_: Throwable) {}
+
+            attachOverlaySafely(activity, root)
+        } catch (t: Throwable) {
+            Logger.e(TAG, "injectStackView error: ${t.message}", "注入错误: ${t.message}", t)
+        }
+    }
+
+    private fun attachOverlaySafely(activity: Activity, root: android.view.View) {
+        try {
+            activity.runOnUiThread {
+                try {
+                    val decor = activity.window?.decorView as? ViewGroup
+                    if (decor != null) {
+                        var existing: android.view.View? = null
+                        for (i in 0 until decor.childCount) {
+                            val c = decor.getChildAt(i)
+                            try {
+                                val t = c.tag
+                                if (t is String && t == "RecentsStackOverlay") { existing = c; break }
+                            } catch (_: Throwable) {}
+                        }
+                        if (existing != null) {
+                            Logger.d(TAG, "overlay-exists", "Overlay exists", "Overlay 已存在")
+                        } else {
+                            try {
+                                root.tag = "RecentsStackOverlay"
+                                val lp = android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
+                                decor.addView(root, lp)
+                                Logger.d(TAG, "overlay-added", "Overlay added", "Overlay 已添加")
+                            } catch (t: Throwable) {
+                                Logger.e(TAG, "decor.addView failed: ${t.message}", "decor.addView 失败: ${t.message}", t)
+                                try { activity.setContentView(root); Logger.d(TAG, "setContentView used", "回退 setContentView") } catch (_: Throwable) {}
+                            }
+                        }
+                    } else {
+                        try { activity.setContentView(root); Logger.d(TAG, "setContentView used", "setContentView") } catch (t: Throwable) { Logger.e(TAG, "setContentView failed: ${t.message}", "setContentView 失败: ${t.message}", t) }
+                    }
+                } catch (t: Throwable) {
+                    Logger.e(TAG, "ui attach error: ${t.message}", "UI 附加错误: ${t.message}", t)
+                }
+            }
+        } catch (t: Throwable) {
+            Logger.e(TAG, "attachOverlaySafely outer error: ${t.message}", "attachOverlaySafely 总体错误: ${t.message}", t)
+        }
+    }
+
+    private fun dumpSystemUiDiagnostics(classLoader: ClassLoader) {
+        try {
+            val candidates = listOf(
+                "com.android.systemui.recents.RecentsImplementation",
+                "com.android.systemui.recents.OverviewProxyRecentsImpl",
+                "com.android.systemui.recents.LauncherProxyService",
+                "com.android.systemui.recents.OverviewProxyPolicy"
+            )
+            val dir = File("/sdcard/RecentsStack")
+            if (!dir.exists()) dir.mkdirs()
+            val out = File(dir, "systemui_dump_${System.currentTimeMillis()}.txt")
+            val fw = FileWriter(out, false)
+            fw.append("RecentsStack SystemUI Diagnostics\nTime: ${Date()}\n")
+            for (n in candidates) {
+                fw.append("---- Class: $n\n")
+                try {
+                    val cls = XposedHelpers.findClassIfExists(n, classLoader)
+                    if (cls == null) {
+                        fw.append("  -> NOT FOUND\n")
+                        continue
+                    }
+                    fw.append("  -> FOUND\n  Declared fields:\n")
+                    for (f in cls.declaredFields) {
+                        try { fw.append("    field: ${f.name} : ${f.type.simpleName}\n") } catch (_: Throwable) {}
+                    }
+                    fw.append("  Declared methods:\n")
+                    for (m in cls.declaredMethods) {
+                        try {
+                            fw.append("    method: ${m.name}(${m.parameterTypes.joinToString(",") { it.simpleName }})\n")
+                        } catch (_: Throwable) {}
+                    }
+                } catch (t: Throwable) {
+                    fw.append("  -> error: ${t.message}\n")
+                }
+            }
+            fw.append("\nSystem properties:\n")
+            try {
+                val getprop = Class.forName("android.os.SystemProperties")
+                val gm = getprop.getMethod("get", String::class.java)
+                listOf("ro.product.model", "ro.build.version.release", "ro.build.version.sdk").forEach { k ->
+                    try { fw.append("  $k = ${gm.invoke(null, k) as? String}\n") } catch (_: Throwable) { fw.append("  $k = <err>\n") }
+                }
+            } catch (_: Throwable) {}
+            fw.flush()
+            fw.close()
+            Logger.d(TAG, "Wrote systemui diagnostics to ${out.absolutePath}", "已写入诊断到 ${out.absolutePath}")
+        } catch (t: Throwable) {
+            Logger.e(TAG, "dumpSystemUiDiagnostics err: ${t.message}", "诊断导出错误: ${t.message}", t)
+        }
+    }
+}
+
+// File: app/src/main/java/com/yourname/recentsstack/RecentTaskStub.kt
+package com.yourname.recentsstack
+
+data class RecentTaskStub(
+    val packageName: String?,
+    val className: String?,
+    val title: String?,
+    val iconPath: String?
+)
+
+// File: app/src/main/java/com/yourname/recentsstack/Logger.kt
+package com.yourname.recentsstack
+
+import android.content.Context
+import de.robv.android.xposed.XposedBridge
+import java.io.File
+import java.io.FileWriter
+import java.text.SimpleDateFormat
+import java.util.*
+
+object Logger {
+    private var BASE_DIR: File = File("/sdcard/RecentsStack")
+    private val LOG_FILE_NAME = "log.txt"
+    private val FULL_FILE_NAME = "full_log.txt"
+    private val DATE_FMT = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+
+    fun init(appContext: Context) {
+        try {
+            val d = appContext.getExternalFilesDir("RecentsStack")
+            if (d != null) {
+                if (!d.exists()) d.mkdirs()
+                BASE_DIR = d
+                d.mkdirs()
+                d.setReadable(true, false)
+                d.setWritable(true, false)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun ensureBaseExists() {
+        try {
+            if (!BASE_DIR.exists()) BASE_DIR.mkdirs()
+        } catch (_: Throwable) {}
+    }
+
+    fun d(tag: String, en: String, zh: String? = null) {
+        val line = buildLine(tag, en, zh)
+        try { XposedBridge.log("[$tag] $en ${if (!zh.isNullOrBlank()) "/ $zh" else ""}") } catch (_: Throwable) {}
+        writeToFile(File(BASE_DIR, LOG_FILE_NAME), line)
+    }
+
+    fun e(tag: String, en: String, zh: String? = null, t: Throwable? = null) {
+        d(tag, "ERROR: $en", if (zh != null) "错误: $zh" else null)
+        if (t != null) {
+            val sw = StringBuilder()
+            sw.append("EX: ").append(t.toString())
+            t.stackTrace.forEach { sw.append("\n\tat ").append(it.toString()) }
+            writeToFile(File(BASE_DIR, LOG_FILE_NAME), sw.toString())
+            writeToFile(File("/data/local/tmp/RecentsStack_log.txt"), sw.toString())
+        }
+    }
+
+    fun appendToFullLog(line: String) {
+        writeToFile(File(BASE_DIR, FULL_FILE_NAME), line + "\n")
+    }
+
+    private fun buildLine(tag: String, en: String, zh: String?): String {
+        val now = now()
+        val sb = StringBuilder()
+        sb.append("[$now] [$tag] EN: ").append(en)
+        if (!zh.isNullOrBlank()) sb.append(" | ZH: ").append(zh)
+        return sb.toString()
+    }
+
+    private fun writeToFile(file: File, content: String) {
+        try {
+            ensureBaseExists()
+            val fw = FileWriter(file, true)
+            fw.append(content)
+            fw.append("\n")
+            fw.flush()
+            fw.close()
+            return
+        } catch (e: Throwable) {
+            try {
+                val fallback = File("/sdcard/RecentsStack")
+                if (!fallback.exists()) fallback.mkdirs()
+                val fw2 = FileWriter(File(fallback, file.name), true)
+                fw2.append(content)
+                fw2.append("\n")
+                fw2.flush()
+                fw2.close()
+                return
+            } catch (_: Throwable) {
+                try {
+                    val f2 = File("/data/local/tmp/${file.name}")
+                    if (!f2.parentFile.exists()) f2.parentFile.mkdirs()
+                    val fw3 = FileWriter(f2, true)
+                    fw3.append(content)
+                    fw3.append("\n")
+                    fw3.flush()
+                    fw3.close()
+                } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    fun now(): String = DATE_FMT.format(Date())
+}
+
+// File: app/src/main/java/com/yourname/recentsstack/DebugActivity.kt
+package com.yourname.recentsstack
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.widget.Button
+import android.widget.TextView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.FileProvider
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.gson.Gson
+import java.io.File
+import java.io.FileWriter
+import java.util.*
+
+class DebugActivity : Activity() {
+    private lateinit var infoTv: TextView
+    private lateinit var rv: RecyclerView
+    private lateinit var exportBtn: Button
+    private lateinit var refreshBtn: Button
+    private lateinit var genFullBtn: Button
+    private val REQ_READ_EXT = 1001
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        try { Logger.init(this) } catch (_: Throwable) {}
+
+        setContentView(R.layout.activity_debug)
+        infoTv = findViewById(R.id.info_tv)
+        rv = findViewById(R.id.debug_rv)
+        exportBtn = findViewById(R.id.export_btn)
+        refreshBtn = findViewById(R.id.refresh_btn)
+        genFullBtn = findViewById(R.id.genfull_btn)
+
+        rv.layoutManager = LinearLayoutManager(this)
+        refreshBtn.setOnClickListener { loadTasks() }
+        exportBtn.setOnClickListener { exportLogs() }
+        genFullBtn.setOnClickListener { generateFullLogAndShare() }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), REQ_READ_EXT)
+            }
+        }
+        loadTasks()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        if (requestCode == REQ_READ_EXT) loadTasks()
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+    }
+
+    private fun loadTasks() {
+        val candidates = arrayListOf<File>()
+        val appDir = getExternalFilesDir("RecentsStack")
+        if (appDir != null) candidates.add(File(appDir, "tasks.json"))
+        candidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/tasks.json"))
+        candidates.add(File("/data/local/tmp/tasks.json"))
+
+        var tf: File? = null
+        for (f in candidates) { if (f.exists()) { tf = f; break } }
+
+        if (tf == null) {
+            infoTv.text = "未检测到 tasks.json（模块可能未注入）。\nNo tasks.json found (module may not be injected)."
+            rv.adapter = RecentsStackAdapter(emptyList())
+            return
+        }
+
+        try {
+            val text = tf.readText()
+            val arr = try {
+                Gson().fromJson(text, Array<RecentTaskStub>::class.java)?.toList() ?: emptyList()
+            } catch (e: Exception) {
+                infoTv.text = "解析 tasks.json 错误: ${e.message}\nParse error: ${e.message}"
+                rv.adapter = RecentsStackAdapter(emptyList())
+                return
+            }
+            infoTv.text = "已加载 ${arr.size} 个任务（Loaded ${arr.size} tasks）"
+            rv.adapter = RecentsStackAdapter(arr)
+        } catch (e: Exception) {
+            infoTv.text = "读取 tasks.json 错误: ${e.message}"
+            rv.adapter = RecentsStackAdapter(emptyList())
+        }
+    }
+
+    private fun exportLogs() {
+        val appDir = getExternalFilesDir("RecentsStack")
+        val candidates = ArrayList<File>()
+        if (appDir != null) {
+            candidates.add(File(appDir, "log.txt"))
+            candidates.add(File(appDir, "full_log.txt"))
+        }
+        candidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/log.txt"))
+        candidates.add(File("/data/local/tmp/log.txt"))
+        candidates.add(File("/data/local/tmp/full_log.txt"))
+
+        var lf: File? = null
+        for (f in candidates) { if (f.exists()) { lf = f; break } }
+
+        if (lf == null) {
+            infoTv.text = "日志文件 log.txt 未找到\nlog.txt not found"
+            return
+        }
+        try {
+            val authority = "${applicationContext.packageName}.fileprovider"
+            val uri: Uri = FileProvider.getUriForFile(this, authority, lf)
+            val share = Intent(Intent.ACTION_SEND)
+            share.type = "text/plain"
+            share.putExtra(Intent.EXTRA_STREAM, uri)
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(share, "分享日志 / Share logs"))
+        } catch (e: Exception) {
+            infoTv.text = "导出失败: ${e.message}\nExport failed: ${e.message}"
+        }
+    }
+
+    private fun generateFullLogAndShare() {
+        val stamp = System.currentTimeMillis()
+        val dir = getExternalFilesDir("RecentsStack") ?: run {
+            val f = File(Environment.getExternalStorageDirectory(), "RecentsStack")
+            if (!f.exists()) f.mkdirs()
+            f
+        }
+        if (!dir.exists()) dir.mkdirs()
+        val out = File(dir, "full_log_$stamp.txt")
+
+        try {
+            val fw = FileWriter(out, false)
+            fw.append("RecentsStack FULL LOG / 完整日志\n")
+            fw.append("Time: ${Date()}\n\n")
+
+            val dumps = ArrayList<File>()
+            getExternalFilesDir("RecentsStack")?.let { d -> dumps.addAll(d.listFiles { f -> f.name.startsWith("systemui_dump_") }?.sortedByDescending { it.name } ?: emptyList()) }
+            dumps.addAll(File(Environment.getExternalStorageDirectory(), "RecentsStack").listFiles { f -> f.name.startsWith("systemui_dump_") }?.sortedByDescending { it.name } ?: emptyList())
+            dumps.addAll(File("/data/local/tmp").listFiles { f -> f.name.startsWith("systemui_dump_") }?.sortedByDescending { it.name } ?: emptyList())
+
+            if (dumps.isEmpty()) fw.append("no systemui_dump_* files found\n") else {
+                for (f in dumps.take(10)) {
+                    fw.append("--- file: ${f.name} ---\n")
+                    try { fw.append(f.readText()); fw.append("\n") } catch (e: Exception) { fw.append("read error: ${e.message}\n") }
+                }
+            }
+
+            fw.append("\n== Main log (log.txt) ==\n")
+            val mainCandidates = arrayListOf<File>()
+            getExternalFilesDir("RecentsStack")?.let { mainCandidates.add(File(it, "log.txt")) }
+            mainCandidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/log.txt"))
+            mainCandidates.add(File("/data/local/tmp/log.txt"))
+            var mainFound = false
+            for (mf in mainCandidates) {
+                if (mf.exists()) {
+                    fw.append(mf.readText()); mainFound = true; break
+                }
+            }
+            if (!mainFound) fw.append("no log.txt found\n")
+
+            fw.append("\n== Full log (full_log.txt) ==\n")
+            val fullCandidates = arrayListOf<File>()
+            getExternalFilesDir("RecentsStack")?.let { fullCandidates.add(File(it, "full_log.txt")) }
+            fullCandidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/full_log.txt"))
+            fullCandidates.add(File("/data/local/tmp/full_log.txt"))
+            var fullFound = false
+            for (ff in fullCandidates) {
+                if (ff.exists()) {
+                    fw.append(ff.readText()); fullFound = true; break
+                }
+            }
+            if (!fullFound) fw.append("no full_log.txt found\n")
+
+            fw.append("\n== tasks.json ==\n")
+            val tasksCandidates = arrayListOf<File>()
+            getExternalFilesDir("RecentsStack")?.let { tasksCandidates.add(File(it, "tasks.json")) }
+            tasksCandidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/tasks.json"))
+            tasksCandidates.add(File("/data/local/tmp/tasks.json"))
+            var tasksFound = false
+            for (tf in tasksCandidates) {
+                if (tf.exists()) {
+                    fw.append(tf.readText()); tasksFound = true; break
+                }
+            }
+            if (!tasksFound) fw.append("no tasks.json found\n")
+
+            fw.append("\n== End of FULL LOG ==\n")
+            fw.flush(); fw.close()
+
+            Logger.appendToFullLog("Full log created: ${out.absolutePath}")
+
+            val authority = "${applicationContext.packageName}.fileprovider"
+            val uri: Uri = FileProvider.getUriForFile(this, authority, out)
+            val share = Intent(Intent.ACTION_SEND)
+            share.type = "text/plain"
+            share.putExtra(Intent.EXTRA_STREAM, uri)
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(share, "分享完整日志 / Share full log"))
+        } catch (e: Exception) {
+            infoTv.text = "生成完整日志失败: ${e.message}\nGenerate full log failed: ${e.message}"
+            Logger.e("DebugActivity", "generateFullLog failed: ${e.message}", "生成完整日志失败：${e.message}", e)
+        }
+    }
+}
+
+// File: app/src/main/java/com/yourname/recentsstack/RecentsStackAdapter.kt
+package com.yourname.recentsstack
+
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.TextView
+import androidx.recyclerview.widget.RecyclerView
+
+class RecentsStackAdapter(private val tasks: List<RecentTaskStub>) : RecyclerView.Adapter<RecentsStackAdapter.VH>() {
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+        val v = LayoutInflater.from(parent.context).inflate(R.layout.item_recent_card, parent, false)
+        return VH(v)
+    }
+
+    override fun onBindViewHolder(holder: VH, position: Int) {
+        val t = tasks[position]
+        val title = if (!t.title.isNullOrBlank()) t.title else t.packageName
+        holder.title.text = title
+        holder.pkg.text = t.packageName ?: ""
+    }
+
+    override fun getItemCount(): Int = tasks.size
+
+    class VH(view: View) : RecyclerView.ViewHolder(view) {
+        val title: TextView = view.findViewById(R.id.card_title)
+        val pkg: TextView = view.findViewById(R.id.card_pkg)
+    }
+}
+
+// File: app/src/main/java/com/yourname/recentsstack/StackLayoutManager.kt
+package com.yourname.recentsstack
+
+import android.content.Context
+import androidx.recyclerview.widget.RecyclerView
+import kotlin.math.min
+
+class StackLayoutManager(private val context: Context) : RecyclerView.LayoutManager() {
+    private val maxVisible = 4
+
+    override fun generateDefaultLayoutParams(): RecyclerView.LayoutParams = RecyclerView.LayoutParams(RecyclerView.LayoutParams.MATCH_PARENT, RecyclerView.LayoutParams.MATCH_PARENT)
+
+    override fun onLayoutChildren(recycler: RecyclerView.Recycler, state: RecyclerView.State) {
+        detachAndScrapAttachedViews(recycler)
+        val itemCount = itemCount
+        if (itemCount == 0) return
+
+        val start = 0
+        val end = min(itemCount - 1, maxVisible - 1)
+        for (i in end downTo start) {
+            val view = recycler.getViewForPosition(i)
+            addView(view)
+            measureChildWithMargins(view, 0, 0)
+            val w = getDecoratedMeasuredWidth(view)
+            val h = getDecoratedMeasuredHeight(view)
+            val left = (width - w) / 2
+            val top = (height - h) / 2
+            layoutDecoratedWithMargins(view, left, top, left + w, top + h)
+
+            val level = end - i
+            val scale = 1f - level * 0.05f
+            view.scaleX = scale
+            view.scaleY = scale
+            view.translationY = level * (h * 0.06f)
+            view.elevation = level.toFloat()
+            view.alpha = 1f - level * 0.05f
+        }
+    }
+}
+
+<!-- File: app/src/main/res/layout/activity_debug.xml -->
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="vertical" android:layout_width="match_parent" android:layout_height="match_parent"
+    android:padding="16dp" android:background="#121212">
+
+    <TextView
+        android:id="@+id/info_tv"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="RecentsStack 调试面板\n（中文 / English）"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:padding="8dp" />
+
+    <LinearLayout
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal"
+        android:layout_marginTop="8dp">
+
+        <Button
+            android:id="@+id/refresh_btn"
+            android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+            android:text="刷新任务\nRefresh" />
+
+        <Button
+            android:id="@+id/genfull_btn"
+            android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+            android:text="生成完整日志\nGenerate Full Log"
+            android:layout_marginStart="8dp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal"
+        android:layout_marginTop="8dp">
+        <Button
+            android:id="@+id/export_btn"
+            android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+            android:text="导出日志\nExport Logs" />
+    </LinearLayout>
+
+    <View android:layout_width="match_parent" android:layout_height="8dp" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/debug_rv"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#1E1E1E" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="提示：请确保 LSPosed 模块已启用并重启 SystemUI。"
+        android:textColor="#CCCCCC"
+        android:paddingTop="8dp"
+        android:textSize="12sp" />
+</LinearLayout>
+
+<!-- File: app/src/main/res/layout/custom_recents.xml -->
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent" android:background="#00000000">
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/stackRecycler" android:layout_width="match_parent" android:layout_height="match_parent"
+        android:clipToPadding="false" android:clipChildren="false" />
+</FrameLayout>
+
+<!-- File: app/src/main/res/layout/item_recent_card.xml -->
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="12dp">
+    <TextView android:id="@+id/card_title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="16sp" android:textColor="#FFFFFF" />
+    <TextView android:id="@+id/card_pkg" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="12sp" android:textColor="#CCCCCC" />
+</LinearLayout>
+
+<!-- File: app/src/main/res/xml/file_paths.xml -->
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-files-path name="ext_files" path="RecentsStack/"/>
+    <external-path name="sdcard" path="RecentsStack/"/>
+</paths>
+
+<!-- File: app/src/main/AndroidManifest.xml (snippets: permissions + provider + activity) -->
+<manifest package="com.yourname.recentsstack" xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="33" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
+    <application android:label="RecentsStack" android:allowBackup="false">
+        <meta-data android:name="xposedmodule" android:value="true"/>
+        <meta-data android:name="xposedminversion" android:value="82"/>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths"/>
+        </provider>
+
+        <activity android:name=".DebugActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+// File: app/build.gradle (core parts)
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+}
+
+android {
+    compileSdk 33
+    defaultConfig {
+        applicationId "com.yourname.recentsstack"
+        minSdk 21
+        targetSdk 33
+        versionCode 1
+        versionName "0.1"
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
+    kotlinOptions { jvmTarget = '1.8' }
+    buildTypes { release { minifyEnabled false } }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.8.0"
+    implementation 'androidx.recyclerview:recyclerview:1.3.0'
+    implementation 'com.google.code.gson:gson:2.10.1'
+    compileOnly files('libs/xposed-api.jar')
+}
+
+<!-- File: app/src/main/res/values/strings.xml -->
+<resources>
+    <string name="app_name">RecentsStack</string>
+    <string name="refresh">刷新任务\nRefresh</string>
+    <string name="export">导出日志\nExport</string>
+    <string name="generate_full">生成完整日志\nGenerate Full Log</string>
+    <string name="no_tasks">未检测到 tasks.json（模块可能未注入）。\nNo tasks.json found (module may not be injected).</string>
+</resources>
