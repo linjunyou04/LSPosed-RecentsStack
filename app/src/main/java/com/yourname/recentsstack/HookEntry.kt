@@ -70,7 +70,7 @@ class HookEntry : IXposedHookLoadPackage {
                         try {
                             val act = param.thisObject as? Activity ?: return
                             val name = act.javaClass.name
-                            Logger.d(TAG, "ACTIVITY_RESUME", "Activity resumed: $name", "Activity 恢复: $name")
+                            Logger.d(TAG, "Activity resumed: $name", "Activity 恢复: $name")
                             val now = System.currentTimeMillis()
                             val last = lastDumpForActivity[name] ?: 0L
                             if (now - last >= DUMP_MIN_INTERVAL_MS) {
@@ -78,7 +78,7 @@ class HookEntry : IXposedHookLoadPackage {
                                 appendFullLogSafe("\n=== Activity Resume: $name @ $now ===\n")
                                 dumpViewTree(act)
                             } else {
-                                Logger.d(TAG, "ACTIVITY_RESUME_THROTTLE", "Throttled dump for $name")
+                                Logger.d(TAG, "Throttled dump for $name")
                             }
                         } catch (t: Throwable) {
                             Logger.e(TAG, "onResume hook err: ${t.message}", "onResume 钩子错误: ${t.message}", t)
@@ -100,7 +100,7 @@ class HookEntry : IXposedHookLoadPackage {
                                     try {
                                         val viewObj = param.args?.getOrNull(0)
                                         val viewClass = viewObj?.javaClass?.name ?: "<null>"
-                                        Logger.d(TAG, "ADD_VIEW", "WindowManagerGlobal.addView: $viewClass")
+                                        Logger.d(TAG, "WindowManagerGlobal.addView: $viewClass")
                                         appendFullLogSafe("=== addView: $viewClass ===\n")
                                     } catch (_: Throwable) {}
                                 }
@@ -123,7 +123,7 @@ class HookEntry : IXposedHookLoadPackage {
                             val v = param.thisObject as? View ?: return
                             val clsName = v.javaClass.name
                             if (clsName.contains("recents", true) || clsName.contains("overview", true) || clsName.contains("task", true)) {
-                                Logger.d(TAG, "RECENTS_VIEW_ATTACH", "View attached: $clsName")
+                                Logger.d(TAG, "View attached: $clsName")
                                 appendFullLogSafe("=== RecentsViewAttached: $clsName ===\n")
                                 val ctx = findContextFromObject(v)
                                 if (ctx is Activity) dumpViewTree(ctx)
@@ -159,10 +159,10 @@ class HookEntry : IXposedHookLoadPackage {
                 try {
                     val cls = XposedHelpers.findClassIfExists(clsName, classLoader)
                     if (cls == null) {
-                        Logger.d(TAG, "candidate-missing", "Candidate not found: $clsName")
+                        Logger.d(TAG, "Candidate not found: $clsName")
                         continue
                     }
-                    Logger.d(TAG, "candidate-found", "Found candidate: $clsName")
+                    Logger.d(TAG, "Found candidate: $clsName")
 
                     for (m in cls.declaredMethods) {
                         try {
@@ -172,13 +172,13 @@ class HookEntry : IXposedHookLoadPackage {
                                     XposedBridge.hookMethod(m, object : XC_MethodHook() {
                                         override fun beforeHookedMethod(param: MethodHookParam) {
                                             try {
-                                                Logger.d(TAG, "method-before", "$clsName.$name BEFORE")
+                                                Logger.d(TAG, "$clsName.$name BEFORE")
                                                 appendFullLogSafe("BEFORE METHOD: $clsName.$name this=${param.thisObject?.javaClass?.name}\n")
                                             } catch (_: Throwable) {}
                                         }
                                         override fun afterHookedMethod(param: MethodHookParam) {
                                             try {
-                                                Logger.d(TAG, "method-after", "$clsName.$name AFTER")
+                                                Logger.d(TAG, "$clsName.$name AFTER")
                                                 appendFullLogSafe("AFTER METHOD: $clsName.$name this=${param.thisObject?.javaClass?.name}\n")
                                                 val ctx = findContextFromObject(param.thisObject) ?: (param.thisObject as? Activity)
                                                 if (ctx is Activity) injectStackView(ctx, classLoader)
@@ -199,7 +199,7 @@ class HookEntry : IXposedHookLoadPackage {
                 }
             }
 
-            Logger.d(TAG, "method-hook-summary", "hooked methods approx: $hooked")
+            Logger.d(TAG, "hooked methods approx: $hooked")
             appendFullLogSafe("HOOK SUMMARY: hooked methods approx: $hooked\n")
         } catch (t: Throwable) {
             Logger.e(TAG, "addRobustMethodHooks failed: ${t.message}", "添加稳健方法钩子失败: ${t.message}", t)
@@ -410,13 +410,13 @@ class HookEntry : IXposedHookLoadPackage {
                             } catch (_: Throwable) {}
                         }
                         if (existing != null) {
-                            Logger.d(TAG, "overlay-exists", "Overlay already present, skipping add")
+                            Logger.d(TAG, "Overlay already present, skipping add")
                         } else {
                             try {
                                 root.tag = "RecentsStackOverlay"
                                 val lp = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                                 decor.addView(root, lp)
-                                Logger.d(TAG, "overlay-added", "Overlay added to decor")
+                                Logger.d(TAG, "Overlay added to decor")
                             } catch (t: Throwable) {
                                 Logger.e(TAG, "decor.addView failed: ${t.message}", "decor.addView 失败: ${t.message}", t)
                                 try { activity.setContentView(root); Logger.d(TAG, "setContentView used as fallback", "回退使用 setContentView") } catch (_: Throwable) {}
