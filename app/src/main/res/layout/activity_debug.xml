@@ -35,8 +35,6 @@
             android:id="@+id/export_btn"
             android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
             android:text="导出日志\nExport Logs" />
-
-        <View android:layout_width="8dp" android:layout_height="1dp" />
     </LinearLayout>
 
     <View android:layout_width="match_parent" android:layout_height="8dp" />
@@ -55,5 +53,4 @@
         android:textColor="#CCCCCC"
         android:paddingTop="8dp"
         android:textSize="12sp" />
-
 </LinearLayout>

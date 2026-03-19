@@ -29,6 +29,8 @@ class DebugActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try { Logger.init(this) } catch (_: Throwable) {}
+
         setContentView(R.layout.activity_debug)
         infoTv = findViewById(R.id.info_tv)
         rv = findViewById(R.id.debug_rv)
@@ -37,12 +39,10 @@ class DebugActivity : Activity() {
         genFullBtn = findViewById(R.id.genfull_btn)
 
         rv.layoutManager = LinearLayoutManager(this)
-
         refreshBtn.setOnClickListener { loadTasks() }
         exportBtn.setOnClickListener { exportLogs() }
         genFullBtn.setOnClickListener { generateFullLogAndShare() }
 
-        // runtime permission
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                 ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), REQ_READ_EXT)
@@ -52,20 +52,26 @@ class DebugActivity : Activity() {
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        if (requestCode == REQ_READ_EXT) {
-            loadTasks()
-        }
+        if (requestCode == REQ_READ_EXT) loadTasks()
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
     private fun loadTasks() {
-        val dir = File(Environment.getExternalStorageDirectory(), "RecentsStack")
-        val tf = File(dir, "tasks.json")
-        if (!tf.exists()) {
+        val candidates = arrayListOf<File>()
+        val appDir = getExternalFilesDir("RecentsStack")
+        if (appDir != null) candidates.add(File(appDir, "tasks.json"))
+        candidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/tasks.json"))
+        candidates.add(File("/data/local/tmp/tasks.json"))
+
+        var tf: File? = null
+        for (f in candidates) { if (f.exists()) { tf = f; break } }
+
+        if (tf == null) {
             infoTv.text = "未检测到 tasks.json（模块可能未注入）。\nNo tasks.json found (module may not be injected)."
             rv.adapter = RecentsStackAdapter(emptyList())
             return
         }
+
         try {
             val text = tf.readText()
             val arr = try {
@@ -84,9 +90,20 @@ class DebugActivity : Activity() {
     }
 
     private fun exportLogs() {
-        val dir = File(Environment.getExternalStorageDirectory(), "RecentsStack")
-        val lf = File(dir, "log.txt")
-        if (!lf.exists()) {
+        val appDir = getExternalFilesDir("RecentsStack")
+        val candidates = ArrayList<File>()
+        if (appDir != null) {
+            candidates.add(File(appDir, "log.txt"))
+            candidates.add(File(appDir, "full_log.txt"))
+        }
+        candidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/log.txt"))
+        candidates.add(File("/data/local/tmp/log.txt"))
+        candidates.add(File("/data/local/tmp/full_log.txt"))
+
+        var lf: File? = null
+        for (f in candidates) { if (f.exists()) { lf = f; break } }
+
+        if (lf == null) {
             infoTv.text = "日志文件 log.txt 未找到\nlog.txt not found"
             return
         }
@@ -103,60 +120,77 @@ class DebugActivity : Activity() {
         }
     }
 
-    /** Generate a full diagnostic bundle: read any systemui_dump_*.txt, log.txt, stack traces, system props, and write a combined file */
     private fun generateFullLogAndShare() {
         val stamp = System.currentTimeMillis()
-        val dir = File(Environment.getExternalStorageDirectory(), "RecentsStack")
+        val dir = getExternalFilesDir("RecentsStack") ?: run {
+            val f = File(Environment.getExternalStorageDirectory(), "RecentsStack")
+            if (!f.exists()) f.mkdirs()
+            f
+        }
         if (!dir.exists()) dir.mkdirs()
         val out = File(dir, "full_log_$stamp.txt")
+
         try {
             val fw = FileWriter(out, false)
             fw.append("RecentsStack FULL LOG / 完整日志\n")
             fw.append("Time: ${Date()}\n\n")
 
-            // 1) systemui dumps (most recent)
-            fw.append("== SystemUI dumps (files) ==\n")
-            val dumps = dir.listFiles { f -> f.name.startsWith("systemui_dump_") }?.sortedByDescending { it.name } ?: emptyList()
-            if (dumps.isEmpty()) fw.append("no systemui_dump_* files found\n")
-            for (f in dumps.take(3)) {
-                fw.append("--- file: ${f.name} ---\n")
-                try { fw.append(f.readText()); fw.append("\n") } catch (e: Exception) { fw.append("read error: ${e.message}\n") }
-            }
+            val dumps = ArrayList<File>()
+            getExternalFilesDir("RecentsStack")?.let { d -> dumps.addAll(d.listFiles { f -> f.name.startsWith("systemui_dump_") }?.sortedByDescending { it.name } ?: emptyList()) }
+            dumps.addAll(File(Environment.getExternalStorageDirectory(), "RecentsStack").listFiles { f -> f.name.startsWith("systemui_dump_") }?.sortedByDescending { it.name } ?: emptyList())
+            dumps.addAll(File("/data/local/tmp").listFiles { f -> f.name.startsWith("systemui_dump_") }?.sortedByDescending { it.name } ?: emptyList())
 
-            // 2) main log
-            fw.append("\n== Main log (log.txt) ==\n")
-            val mainlog = File(dir, "log.txt")
-            if (mainlog.exists()) fw.append(mainlog.readText()) else fw.append("no log.txt found\n")
-
-            // 3) stack traces of current process (DebugActivity) - helpful for local crashes
-            fw.append("\n== Stack traces (current process) ==\n")
-            val traces = Thread.getAllStackTraces()
-            for ((t, st) in traces) {
-                fw.append("Thread: ${t.name} (id=${t.id})\n")
-                st.forEach { fw.append("\t at $it\n") }
-            }
-
-            // 4) system properties
-            fw.append("\n== System properties ==\n")
-            try {
-                val getprop = Class.forName("android.os.SystemProperties")
-                val g = getprop.getMethod("get", String::class.java)
-                listOf("ro.product.model", "ro.build.version.release", "ro.build.version.sdk", "ro.build.fingerprint").forEach { key ->
-                    try {
-                        val v = g.invoke(null, key) as? String
-                        fw.append("$key = ${v ?: "<null>"}\n")
-                    } catch (_: Throwable) { fw.append("$key = <err>\n") }
+            if (dumps.isEmpty()) fw.append("no systemui_dump_* files found\n") else {
+                for (f in dumps.take(10)) {
+                    fw.append("--- file: ${f.name} ---\n")
+                    try { fw.append(f.readText()); fw.append("\n") } catch (e: Exception) { fw.append("read error: ${e.message}\n") }
                 }
-            } catch (_: Throwable) { fw.append("SystemProperties unavailable\n") }
+            }
+
+            fw.append("\n== Main log (log.txt) ==\n")
+            val mainCandidates = arrayListOf<File>()
+            getExternalFilesDir("RecentsStack")?.let { mainCandidates.add(File(it, "log.txt")) }
+            mainCandidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/log.txt"))
+            mainCandidates.add(File("/data/local/tmp/log.txt"))
+            var mainFound = false
+            for (mf in mainCandidates) {
+                if (mf.exists()) {
+                    fw.append(mf.readText()); mainFound = true; break
+                }
+            }
+            if (!mainFound) fw.append("no log.txt found\n")
+
+            fw.append("\n== Full log (full_log.txt) ==\n")
+            val fullCandidates = arrayListOf<File>()
+            getExternalFilesDir("RecentsStack")?.let { fullCandidates.add(File(it, "full_log.txt")) }
+            fullCandidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/full_log.txt"))
+            fullCandidates.add(File("/data/local/tmp/full_log.txt"))
+            var fullFound = false
+            for (ff in fullCandidates) {
+                if (ff.exists()) {
+                    fw.append(ff.readText()); fullFound = true; break
+                }
+            }
+            if (!fullFound) fw.append("no full_log.txt found\n")
+
+            fw.append("\n== tasks.json ==\n")
+            val tasksCandidates = arrayListOf<File>()
+            getExternalFilesDir("RecentsStack")?.let { tasksCandidates.add(File(it, "tasks.json")) }
+            tasksCandidates.add(File(Environment.getExternalStorageDirectory(), "RecentsStack/tasks.json"))
+            tasksCandidates.add(File("/data/local/tmp/tasks.json"))
+            var tasksFound = false
+            for (tf in tasksCandidates) {
+                if (tf.exists()) {
+                    fw.append(tf.readText()); tasksFound = true; break
+                }
+            }
+            if (!tasksFound) fw.append("no tasks.json found\n")
 
             fw.append("\n== End of FULL LOG ==\n")
-            fw.flush()
-            fw.close()
+            fw.flush(); fw.close()
 
-            // also append a short entry into Logger.full_log
             Logger.appendToFullLog("Full log created: ${out.absolutePath}")
 
-            // share file via FileProvider
             val authority = "${applicationContext.packageName}.fileprovider"
             val uri: Uri = FileProvider.getUriForFile(this, authority, out)
             val share = Intent(Intent.ACTION_SEND)

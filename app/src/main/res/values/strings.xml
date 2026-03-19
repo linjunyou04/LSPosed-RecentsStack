@@ -1,4 +1,3 @@
-<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">RecentsStack</string>
     <string name="refresh">刷新任务\nRefresh</string>
