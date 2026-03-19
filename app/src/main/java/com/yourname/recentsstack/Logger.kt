@@ -32,14 +32,34 @@ object Logger {
         } catch (_: Throwable) {}
     }
 
+    // 3参数版本
     fun d(tag: String, en: String, zh: String? = null) {
         val line = buildLine(tag, en, zh)
         try { XposedBridge.log("[$tag] $en ${if (!zh.isNullOrBlank()) "/ $zh" else ""}") } catch (_: Throwable) {}
         writeToFile(File(BASE_DIR, LOG_FILE_NAME), line)
     }
 
+    // 4参数版本 (tag, subTag, en, zh)
+    fun d(tag: String, subTag: String, en: String, zh: String) {
+        val line = buildLine("$tag/$subTag", en, zh)
+        try { XposedBridge.log("[$tag/$subTag] $en / $zh") } catch (_: Throwable) {}
+        writeToFile(File(BASE_DIR, LOG_FILE_NAME), line)
+    }
+
     fun e(tag: String, en: String, zh: String? = null, t: Throwable? = null) {
         d(tag, "ERROR: $en", if (zh != null) "错误: $zh" else null)
+        if (t != null) {
+            val sw = StringBuilder()
+            sw.append("EX: ").append(t.toString())
+            t.stackTrace.forEach { sw.append("\n\tat ").append(it.toString()) }
+            writeToFile(File(BASE_DIR, LOG_FILE_NAME), sw.toString())
+            writeToFile(File("/data/local/tmp/RecentsStack_log.txt"), sw.toString())
+        }
+    }
+
+    // 4参数版本的错误日志
+    fun e(tag: String, subTag: String, en: String, zh: String, t: Throwable? = null) {
+        d("$tag/$subTag", "ERROR: $en", "错误: $zh")
         if (t != null) {
             val sw = StringBuilder()
             sw.append("EX: ").append(t.toString())
